@@ -1,0 +1,74 @@
+---
+title: "Ktor servers"
+description: "The platform builds every Ktor server in your project and runs it on its own host. When the load goes up, it adds replicas."
+---
+## Set up the module
+
+A module is a Ktor server when it applies the `application` plugin and either depends on a `ktor-server-*` artifact or applies the Ktor Gradle plugin (`io.ktor.plugin`):
+
+```kotlin
+plugins {
+    kotlin("jvm")
+    application
+}
+
+application {
+    mainClass = "MainKt"
+}
+
+dependencies {
+    implementation("io.ktor:ktor-server-netty:3.6.0")
+}
+```
+
+The platform runs `installDist` and starts the app with the start script it produces.
+
+## Listen on `PORT`
+
+The platform tells your server which port to use in the `PORT` env var. Read it, and fall back to a local default:
+
+```kotlin
+fun main() {
+    val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
+    embeddedServer(Netty, port = port) {
+        routing {
+            get("/") { call.respondText("Hello, world!") }
+        }
+    }.start(wait = true)
+}
+```
+
+If the new version does not start within 5 minutes, or keeps crashing, its target fails and the previous version keeps running.
+
+## Hosts
+
+- Every Ktor module gets `my-app--<module>.atoll.app`.
+- The [primary module](/primary-module) also gets the bare host, `my-app.atoll.app`.
+- [Previews](/deploy/previews#hosts) get their own hosts, such as `my-app--pr-42--app.atoll.app`.
+
+## Several servers
+
+Every Ktor module deploys, each as its own app. They roll out one by one, and each one counts on its own: if `:admin` fails to start, `:api` still goes live and the deployment is `PARTIAL`. The failed module keeps its previous version.
+
+Modules you remove from the build are stopped after the next deployment.
+
+## Configuration
+
+Your server reads [environment variables](/configure/environment-variables) set for the runtime. `PORT` and names starting with `ATOLL_` are reserved.
+
+## Logs
+
+The panel's **Logs** tab shows the output of every replica of a Ktor module, live. From the CLI:
+
+```sh
+atoll logs --project my-app --follow                 # the primary module
+atoll logs --project my-app --module :admin          # another module
+```
+
+Each line shows the local time, the replica and the text. Secret values are masked. Build logs are separate: see [Deployments](/deploy/deployments#logs).
+
+## Scaling
+
+Each module has its own scaling settings on the project's **Scaling** tab: a size (`xs` to `xl`, from a quarter of a vCPU and 512 MB up to 4 vCPUs and 8 GB per replica), a range of replicas, and whether it scales to zero while nobody uses it. The platform adds replicas when their average CPU use goes above 70% of their size and removes them when it falls, within that range. A new deployment keeps the number of replicas running at the time. You pay for the vCPU-hours and GB-hours of memory the replicas use. See [Scaling](/run/scaling) and [Billing](/teams/billing).
+
+Apps are also stopped when the org's billing suspends them; see [What happens at a limit](/teams/billing#what-happens-at-a-limit).

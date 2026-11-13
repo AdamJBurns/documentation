@@ -1,0 +1,96 @@
+---
+title: "Android apps"
+description: "The platform builds your Android app with the rest of your project, signs it with your keystore and attaches the APK and App Bundle to the deployment. It can also upload the App Bundle to Google Play's internal track."
+---
+## Set up the module
+
+Any module that applies the Android application plugin is picked up, in a Kotlin Multiplatform project or on its own:
+
+```kotlin
+plugins {
+    id("com.android.application")
+}
+```
+
+## Release or debug
+
+What the platform builds depends on the keystore secrets:
+
+| Keystore secrets set | The platform runs | You get |
+|----------------------|------------|---------|
+| All four, see below | `assembleRelease` and `bundleRelease`, signed with your keystore | `androidApp-release.apk` and `androidApp-release.aab` |
+| None | `assembleDebug` | `androidApp-debug.apk`, signed with a debug key |
+| Only some | nothing | The Android target fails and names the missing ones |
+
+The file names are the ones Gradle gives them: the module name, then the variant. With product flavors you get one file per flavor. A debug build carries a note that says how to get a signed one. A debug APK installs on test devices but cannot go to a store.
+
+## Signing
+
+Store the keystore and its passwords as secret env vars for builds. Secret values are stored encrypted, are never shown again, and are masked in build logs.
+
+| Env var | Value |
+|---------|-------|
+| `ANDROID_KEYSTORE_BASE64` | The keystore file (JKS or PKCS12), base64-encoded |
+| `ANDROID_KEYSTORE_PASSWORD` | The keystore password |
+| `ANDROID_KEY_ALIAS` | The alias of the key inside the keystore |
+| `ANDROID_KEY_PASSWORD` | The password of that key |
+
+To keep the passwords out of your shell history, write them to a `.env` file, import it as secrets, and delete the file:
+
+```sh
+cat > android.env <<EOF
+ANDROID_KEYSTORE_BASE64=$(base64 -w0 upload.jks)
+ANDROID_KEYSTORE_PASSWORD=keystore-password
+ANDROID_KEY_ALIAS=upload
+ANDROID_KEY_PASSWORD=key-password
+EOF
+atoll env import android.env --secret --no-runtime
+rm android.env
+```
+
+On macOS, use `base64 -i upload.jks` instead of `base64 -w0 upload.jks`. You can also paste the values in the project's **Env** tab.
+
+The platform checks the secrets before it builds. If the base64 is broken, the keystore does not open with the password, the alias is not in it, or the key password is wrong, the Android target fails with that reason.
+
+You do not need a signing config in your Gradle build: the platform sets one on the `release` build type for you, and the keystore never has to be in your repository. The secrets are read from the environment being built, so previews can use another key, or none to get debug builds.
+
+See [Environment variables](/configure/environment-variables).
+
+## Getting the files
+
+The APK and the App Bundle are artifacts of the deployment. You find them:
+
+- in the panel, on the deployment;
+- at the end of `atoll deploy`, under the Android target:
+
+```text
+  ANDROID  :androidApp  READY
+      androidApp-release.aab (9.8 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/androidApp-release.aab
+      androidApp-release.apk (6.4 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/androidApp-release.apk
+```
+
+The platform keeps the files of the last 10 finished deployments per project and environment. Download builds you want to keep longer.
+
+## Google Play
+
+The platform can upload the signed App Bundle of every release build to the internal testing track of Google Play:
+
+1. Create the app in the Play Console. The platform uploads to an existing app; it does not create one.
+2. Create a Google Cloud service account, give it access to the app in the Play Console, and download its JSON key.
+3. Store the key as a secret build env var named `PLAY_SERVICE_ACCOUNT_JSON`:
+
+```sh
+echo "PLAY_SERVICE_ACCOUNT_JSON='$(cat service-account.json)'" > play.env
+atoll env import play.env --secret --no-runtime
+rm play.env
+```
+
+After each release build, the Android target gets a note with the result, e.g. "Uploaded version 42 to the Google Play internal track." For an app that is still a draft in the Play Console, the release is uploaded as a draft; roll it out there. Raise `versionCode` for every build you want uploaded. A failed upload does not fail the target: the files are built and attached either way, and the note says what went wrong. With several release variants, Google Play gets the one of the default flavors, else the first.
+
+Debug builds are never uploaded.
+
+## When the Android build fails
+
+The Android target fails on its own. Targets that did build still go live, and the deployment ends as `PARTIAL`. See [Deployments](/deploy/deployments).
+
+A self-hosted server that builds on its own host (not on Kubernetes) and has no Android SDK skips Android targets instead. They show as `SKIPPED` with "No Android SDK on this build host", and do not count as failures. The Kubernetes builder image includes the SDK.

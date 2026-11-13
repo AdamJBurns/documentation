@@ -1,0 +1,165 @@
+---
+title: "Backups and restore"
+---
+| Data | Where | Loss means | Backup |
+|------|-------|------------|--------|
+| Deployments, accounts, projects, env vars, domains, billing | Postgres `atoll-db` | Everything | Continuous, automatic (below) |
+| `ATOLL_ENV_KEYS` and other Secrets | Kubernetes Secrets | Stored env vars cannot be decrypted | Export once, after every change |
+| Sources, live web apps, artifacts | SeaweedFS bucket `atoll` | Web apps go offline, old deployments cannot be promoted or rebuilt | Nightly copy off-site |
+| App images | SeaweedFS bucket `atoll-registry` (zot) | Apps fail to start on a new node until redeployed | With the bucket copy below |
+| Cluster state | k3s etcd | Reinstall from helmfile + restore data | k3s snapshots |
+
+## Postgres
+
+CloudNativePG archives every WAL segment to the off-site bucket (`postgres.backup.destinationPath`) as soon as
+it is written, and takes a base backup daily (`postgres.backup.schedule`). Backups older than
+`postgres.backup.retention` are removed. That allows point-in-time recovery to any second in the window.
+
+Check:
+
+```sh
+kubectl -n atoll get backups.postgresql.cnpg.io
+kubectl -n atoll get objectstores.barmancloud.cnpg.io atoll-backups -o jsonpath='{.status}'
+kubectl -n atoll get cluster.postgresql.cnpg.io atoll-db -o jsonpath='{.status.conditions}'   # ContinuousArchiving=True
+```
+
+Take one now (before upgrades):
+
+```sh
+kubectl -n atoll create -f - <<EOF
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: atoll-db-manual-$(date +%Y%m%d%H%M)
+spec:
+  cluster: { name: atoll-db }
+  method: plugin
+  pluginConfiguration: { name: barman-cloud.cloudnative-pg.io }
+EOF
+```
+
+### Restore
+
+Restore into a new cluster, check it, then point the platform at it. CloudNativePG never overwrites a running cluster.
+
+1. Stop writes: `kubectl -n atoll scale deployment/atoll-server --replicas=0`.
+2. Create the recovered cluster (`targetTime` is optional; without it the latest WAL is replayed):
+
+   ```yaml
+   apiVersion: postgresql.cnpg.io/v1
+   kind: Cluster
+   metadata:
+     name: atoll-db-restored
+     namespace: atoll
+   spec:
+     instances: 3
+     storage: { size: 20Gi }
+     walStorage: { size: 10Gi }
+     bootstrap:
+       recovery:
+         source: origin
+         recoveryTarget:
+           targetTime: "2026-10-19 21:00:00+00"
+     externalClusters:
+       - name: origin
+         plugin:
+           name: barman-cloud.cloudnative-pg.io
+           parameters:
+             barmanObjectName: atoll-backups
+             serverName: atoll-db
+   ```
+
+3. When it is healthy, switch the server: `atoll.values.postgres.url` to
+   `jdbc:postgresql://atoll-db-restored-rw.atoll.svc.cluster.local:5432/atoll` and `existingSecret` to
+   `atoll-db-restored-app`, then `helmfile ... apply`. The app user's password is new; the old one is not needed.
+4. Archive the restored cluster to a new path before it is used in production (otherwise both write to
+   `atoll-db/`): give it its own `ObjectStore` or a different `serverName`.
+
+Rehearse this every few months.
+
+## Secrets
+
+Export the Secrets that cannot be regenerated and keep them encrypted outside the cluster (age, sops, a
+password manager):
+
+```sh
+for s in atoll/atoll-env atoll/atoll-storage registry/zot-s3 registry/zot-users atoll/atoll-backup-s3 \
+  atoll/atoll-files-admin atoll-storage/atoll-store-backups; do
+  kubectl -n "${s%/*}" get secret "${s#*/}" -o yaml
+done | age -r <your-age-recipient> > atoll-secrets-$(date +%F).yaml.age
+```
+
+`ATOLL_ENV_KEYS` matters most: Postgres backups contain env vars encrypted with it.
+
+## Object storage
+
+SeaweedFS replicates within the cluster (`storage.replication: "001"`), which protects against a failed disk or
+node, not against losing the site. Copy the bucket off-site nightly, for example with rclone in a CronJob (do the
+same for the users' Files buckets and `atoll-store-backups` on the Files SeaweedFS, see [storage.md](/self-hosting/storage)):
+
+```sh
+kubectl -n seaweedfs create secret generic rclone-config --from-file=rclone.conf
+```
+
+```ini
+# rclone.conf
+[atoll]
+type = s3
+provider = SeaweedFS
+endpoint = http://seaweedfs-s3.seaweedfs.svc.cluster.local:8333
+access_key_id = atoll
+secret_access_key = <from atoll/atoll-storage>
+
+[offsite]
+type = s3
+provider = Other
+endpoint = https://s3.example.com
+access_key_id = ...
+secret_access_key = ...
+```
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: atoll-storage-offsite, namespace: seaweedfs }
+spec:
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: rclone
+              image: rclone/rclone:1
+              args: ["sync", "atoll:atoll", "offsite:atoll-storage-backup", "--config", "/config/rclone.conf"]
+              volumeMounts: [{ name: config, mountPath: /config }]
+          volumes: [{ name: config, secret: { secretName: rclone-config } }]
+```
+
+Restore by running the same sync in the other direction into a fresh `atoll` bucket.
+
+## Registry
+
+zot keeps its blobs in the SeaweedFS bucket `atoll-registry`, replicated like the `atoll` bucket. Add it to the
+off-site copy (a second `rclone sync atoll:atoll-registry offsite:atoll-registry-backup`, with the `registry`
+user's keys from `registry/zot-s3`) if you want images back without redeploying. The platform's own images come from
+GHCR, so the platform can be reinstalled without zot.
+
+## Cluster state
+
+k3s snapshots etcd every 12 hours and keeps 5 (`/var/lib/rancher/k3s/server/db/snapshots`). To ship them
+off-site add to `deploy/selfhost/k3s/config.yaml`:
+
+```yaml
+etcd-s3: true
+etcd-s3-endpoint: s3.example.com
+etcd-s3-bucket: atoll-etcd
+etcd-s3-access-key: ...
+etcd-s3-secret-key: ...
+```
+
+In practice a lost cluster is rebuilt faster from the helmfile than from etcd: reinstall k3s, re-create the
+Secrets from your export, run `helmfile sync` with `postgres` restored from backup (see above, bootstrap the
+`atoll-db` cluster from `recovery`), and copy the bucket back.

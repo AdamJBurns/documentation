@@ -1,0 +1,31 @@
+---
+title: "Changelog"
+description: "What changed in each release. The CLI, server and panel share one version number."
+---
+<Update label="0.2.0" description="October 2026">
+  Teams, previews and billing.
+
+  - **Accounts and orgs.** Sign up with email, GitHub or Google. Projects belong to orgs, with Viewer, Developer, Admin and Owner [roles](/teams/teams).
+  - **CLI sign-in.** `atoll login` signs in through the browser; `atoll logout` and `atoll whoami` round it off. Personal access tokens for CI.
+  - **Git integration.** Link a GitHub repository: pushes deploy to production and pull requests get [previews](/deploy/previews).
+  - **Promote and rollback.** `atoll promote` and `atoll rollback` put an earlier deployment live again without a rebuild; `atoll promote --to production` puts a preview on production, and `--rebuild` builds it again. `atoll cancel` stops a running one, which ends as `CANCELLED`.
+  - **Runtime logs.** `atoll logs --project` prints and follows the output of a running Ktor server.
+  - **Env vars and secrets** per environment, for builds, running servers or both. `atoll env`.
+  - **Custom domains** with automatic certificates. `atoll domains`.
+  - **Billing.** A free amount every month, pay-as-you-go past it, and spend limits. Running apps pause when an allowance or the limit is reached. See [Billing](/teams/billing).
+  - **Android release signing.** Store the keystore as secret env vars and the platform signs the release APK and App Bundle. Without them, you still get a debug APK. Signed App Bundles can go to Google Play's internal track. See [Android apps](/targets/android#signing).
+  - **Desktop extras.** Next to the JAR, an app archive with its own Java runtime and, when configured, a `.deb` package.
+  - **iOS** targets are recognised and skipped until macOS builders are ready. iOS signing comes with them.
+  - **Self-hosting.** A Helm chart and a step-by-step [guide](/self-hosting/overview) for running the platform on your own servers.
+</Update>
+
+<Update label="0.1.0" description="October 2026">
+  The first deploys.
+
+  - `atoll deploy` uploads a Gradle build, detects its targets and deploys them. Exit codes `0`, `2` and `1` for `READY`, `PARTIAL` and `FAILED`.
+  - Ktor servers run on their own hosts; every Ktor module deploys, and `atoll.primary` picks the one on the bare host.
+  - Wasm and JS web apps are served from their own hosts.
+  - Android and Compose Desktop builds are attached to the deployment as downloads.
+  - `atoll list`, `atoll logs --follow` and `atoll status`.
+  - Runs on a single machine or on Kubernetes, with Postgres and S3-compatible storage.
+</Update>

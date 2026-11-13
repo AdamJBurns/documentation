@@ -1,0 +1,90 @@
+---
+title: "Troubleshooting"
+description: "Start with the overview:"
+---
+```sh
+kubectl get pods -A | grep -v -E 'Running|Completed'
+kubectl get certificate,ingress -A
+kubectl -n atoll logs deploy/atoll-server --tail=100
+kubectl get events -A --sort-by=.lastTimestamp | tail -30
+```
+
+## Install
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| `helmfile sync` stops at a release with `context deadline exceeded` | A pod did not get ready. `kubectl -n <ns> get pods`, then `describe` it. Usually a missing Secret (run `create-secrets.sh`), an unbound volume or an image pull error |
+| atoll-server `CreateContainerConfigError` | A referenced Secret is missing: `atoll-env`, `atoll-storage`, `atoll-db-app` (created by CloudNativePG once the cluster is up) or a feature `existingSecret` |
+| atoll-server restarts, log says `ATOLL_DATABASE_URL is required` or connection refused | `kubectl -n atoll get cluster.postgresql.cnpg.io atoll-db`; the server waits on its startup probe for 3 minutes, then restarts until Postgres is ready |
+| Traefik Service `EXTERNAL-IP` stays `<pending>` | MetalLB has no free address: check `metallb.addresses`, `kubectl -n metallb-system get ipaddresspool`, and that k3s runs with `servicelb` disabled |
+| IP assigned but unreachable from outside | L2 announcements need the IP on the nodes' subnet; check `kubectl -n metallb-system logs ds/metallb-speaker`. With `externalTrafficPolicy: Local` only nodes running Traefik answer |
+
+## Certificates
+
+```sh
+kubectl get certificate,certificaterequest,order,challenge -A
+kubectl -n cert-manager logs deploy/cert-manager --tail=100
+```
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| HTTP-01 challenge `pending`, "connection refused" or 404 | Port 80 must reach Traefik from the internet. The web entrypoint redirects to HTTPS but lets ACME challenges through (`allowACMEByPass`) |
+| DNS-01 `pending` | Cloudflare token lacks `Zone:DNS:Edit` for that zone, or the RFC2136 server rejects the TSIG key. cert-manager checks propagation against 1.1.1.1/9.9.9.9; a private-only zone never validates |
+| `429 rateLimited` | Let's Encrypt limits; use the staging `tls.acmeServer` until it works |
+| Browsers show "TRAEFIK DEFAULT CERT" on an app | The wildcard certificate is not ready yet, or the `TLSStore` `default` is missing (`kubectl -n atoll get tlsstore`). Only one `default` TLSStore may exist |
+
+## Builds
+
+```sh
+kubectl -n atoll-builds get jobs,pods
+kubectl -n atoll-builds logs job/atoll-build-<id> -c build      # -c publish for the image push
+kubectl -n atoll-builds describe pod -l job-name=atoll-build-<id>
+```
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| "Waiting for cluster capacity" | No node has 2 CPU / 6 GiB free; add nodes or lower `atoll.buildCpu/buildMemory` |
+| Pod `ImagePullBackOff` on the builder image | The builder image is private: set `registry.builderPullSecret` to a dockerconfigjson Secret in `atoll-builds` for its registry ([registry.md](/self-hosting/registry)) |
+| App pod `ImagePullBackOff` with 401 | `atoll-apps/atoll-registry-pull` is missing or its `auths` key is not the host in `ATOLL_REGISTRY_PULL` |
+| Gradle cannot download dependencies | Build pods may only reach public IPs on port 443. A Maven mirror inside your network needs an extra egress rule (`networkPolicy.builds.extraEgress`) |
+| `crane` push fails with 401 | `registry.pushSecret` unset, or the `auths` key or password in `atoll-builds/atoll-registry-push` is wrong ([registry.md](/self-hosting/registry)) |
+| "Registry push secret ... not found" | Create the push Secret in the builds namespace (`scripts/create-secrets.sh` does) |
+| Push fails with timeout / connection refused | Pods must resolve `registry.example.com` to the Traefik IP. If the public DNS points at a NAT address the cluster cannot reach (no hairpin NAT), add a CoreDNS override (below) |
+| Build pod `CreateContainerError` with gVisor | `runsc` is not registered on that node; see [install.md](/self-hosting/install#2-optional-gvisor-for-builds) |
+| "Build outputs are limited to ... (ATOLL_BUILD_MAX_OUTPUT_BYTES)" or "... is larger than ... (ATOLL_BUILD_MAX_FILE_BYTES)" | The build uploaded more than `limits.*` allow. Raise the limit (and `server.scratchSize` with it) if the outputs are legitimate |
+| Deployments refused: "stores ... more than its quota" | The project's kept sources and outputs exceed `limits.projectStorageBytes`. Retiring previews frees space; the quota is measured after each garbage collection pass |
+| Build fails while "downloading source" with a 404 or connection refused | Build pods call `ATOLL_INTERNAL_URL` on port 8081. A custom `urls.internal` must use that port, and a custom NetworkPolicy must admit it |
+
+CoreDNS override for split-horizon DNS (k3s reads `coredns-custom`):
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: coredns-custom, namespace: kube-system }
+data:
+  atoll.override: |
+    hosts {
+      192.168.10.240 registry.example.com atoll.example.com
+      fallthrough
+    }
+```
+
+## Apps
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| App host returns a web app 404 from atoll-server | The app's exact-host Ingress is missing or the wildcard took over: check `kubectl -n atoll-apps get ingress` and that `atoll-sites` has `router.priority: "1"` |
+| `ImagePullBackOff` in `atoll-apps` | Nodes lack pull credentials (see above) or cannot resolve the registry host |
+| App unreachable but pod is running | The `atoll-apps` NetworkPolicy only admits the ingress controller namespace (`ingress.controllerNamespace`) on port 8080 |
+| HPA shows `<unknown>` | metrics-server is not ready: `kubectl top pods -n atoll-apps` |
+
+## Storage and database
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| Uploads or registry pushes fail with S3 `AccessDenied` | Keys in `atoll/atoll-storage` or `registry/zot-s3` differ from `seaweedfs/seaweedfs-s3-config`. Delete `seaweedfs-s3-config`, re-run `create-secrets.sh` (it rebuilds the user list from the other two), then restart the filer, zot and atoll-server |
+| Something in the cluster cannot reach SeaweedFS | Only atoll-server and zot may use its S3 port; the rest of SeaweedFS is private to its own pods. Add a rule to `networkPolicy.extraIngress` in `values/seaweedfs.yaml.gotmpl` |
+| An app cannot reach a database inside the cluster | App pods may not reach private addresses. Add an egress rule for it to `networkPolicy.apps.extraEgress` |
+| Uploads over ~100 MB fail | Traefik entrypoint timeouts (`readTimeout: 600s` in `values/traefik.yaml.gotmpl`) |
+| `ContinuousArchiving` is False | Wrong backup bucket, endpoint or keys: `kubectl -n atoll logs atoll-db-1 -c plugin-barman-cloud` |
+| Postgres primary failed | CloudNativePG promotes a replica automatically; `atoll-db-rw` follows it. Check `kubectl cnpg status atoll-db -n atoll` (kubectl plugin) |

@@ -1,0 +1,218 @@
+---
+title: "Configuration"
+description: "Two layers:"
+---
+- **Site values** for the helmfile (`deploy/selfhost/environments/default.yaml`, copied to your own file).
+  They describe the site and are turned into values for each chart.
+- **Chart values** of `deploy/helm/atoll`. The helmfile sets them in `deploy/selfhost/values/atoll.yaml.gotmpl`;
+  override any of them with `atoll.values` in your site file.
+
+## Site values (helmfile)
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `replicas` | `2` | Replicas of stateless controllers (Traefik, cert-manager, CNPG operator, metrics-server); also 3 SeaweedFS masters when > 1 |
+| `domains.public` | `atoll.example.com` | API host, `ATOLL_PUBLIC_URL=https://<host>` |
+| `domains.panel` | empty | Panel host, `ATOLL_PANEL_URL`; empty uses the API host |
+| `domains.apps` | `apps.example.com` | `ATOLL_APPS_DOMAIN`; needs `*.apps...` in DNS |
+| `domains.registry` | `registry.example.com` | zot host; `ATOLL_REGISTRY_PUSH` and `_PULL` |
+| `domains.grafana` | `grafana.example.com` | Grafana host |
+| `tls.mode` | `acme` | `acme` (Let's Encrypt) or `local` (self-signed CA for test clusters) |
+| `tls.email` | — | ACME account email |
+| `tls.acmeServer` | LE production | Use the staging URL while testing |
+| `tls.http01Issuer` | `letsencrypt` | ClusterIssuer for single hosts and custom domains; also `ATOLL_DOMAINS_CLUSTER_ISSUER` |
+| `tls.dns01Issuer` | `letsencrypt-dns` | ClusterIssuer for `*.apps` |
+| `tls.dns01.provider` | `cloudflare` | `cloudflare` or `rfc2136` |
+| `tls.dns01.cloudflare.secret/key` | `cloudflare-api-token`/`api-token` | Secret in `cert-manager` |
+| `tls.dns01.rfc2136.*` | — | `nameserver` (host:port), `tsigKeyName`, `tsigAlgorithm`, Secret `rfc2136-tsig`/`tsig-secret` |
+| `metallb.enabled` | `true` | Install MetalLB; turn off where the platform provides LoadBalancers |
+| `metallb.addresses` | example range | Free IPs (ranges or CIDRs) on the node network |
+| `ingress.loadBalancerIP` | empty | Pin Traefik to one IP of the pool |
+| `postgres.instances` | `3` | Postgres pods (1 primary + replicas) |
+| `postgres.storage` / `walStorage` | `20Gi` / `10Gi` | Volume sizes per instance |
+| `postgres.storageClass` | cluster default | |
+| `postgres.backup.enabled` | `true` | Continuous WAL archiving + daily base backups |
+| `postgres.backup.destinationPath` | — | `s3://bucket/prefix` |
+| `postgres.backup.endpointURL` | — | S3 endpoint for non-AWS providers |
+| `postgres.backup.secret` | `atoll-backup-s3` | Secret with `ACCESS_KEY_ID`, `ACCESS_SECRET_KEY` |
+| `postgres.backup.retention` | `30d` | Recovery window |
+| `postgres.backup.schedule` | `0 0 3 * * *` | Base backup schedule (seconds first) |
+| `storage.volumeReplicas` | `3` | SeaweedFS volume servers |
+| `storage.volumeSize` | `200Gi` | Per volume server |
+| `storage.replication` | `001` | Copies: `000` none, `001` one extra on another server |
+| `storage.masterSize` / `filerSize` | `2Gi` / `20Gi` | Metadata volumes |
+| `atoll.image` / `atoll.tag` | `ghcr.io/new-horizon-code-repo/atoll-server` / `0.2.0` | Server image |
+| `atoll.builderImage` | `ghcr.io/new-horizon-code-repo/atoll-builder:0.2.0` | `ATOLL_BUILDER_IMAGE` |
+| `atoll.imagePullSecret` | empty | dockerconfigjson Secret in `atoll` if the server image is private |
+| `atoll.replicas` | `2` | atoll-server replicas |
+| `atoll.gvisor` | `false` | Run builds in the `gvisor` RuntimeClass |
+| `atoll.buildCpu` / `buildMemory` | `2` / `6Gi` | Per build pod |
+| `atoll.buildNodeSelector` / `buildTolerations` | `{}` / `[]` | Keep builds on a dedicated node pool, see [install.md](/self-hosting/install#keep-builds-on-their-own-nodes) |
+| `atoll.values` | `{}` | Extra chart values, merged last |
+| `scaleToZero.enabled` | `true` (`false` in `local`) | KEDA and its HTTP add-on in `keda`, so apps can [scale to zero](/self-hosting/kubernetes#scaling); sets `features.scaling.scaleToZero` |
+| `datastore.enabled` | `true` | Users' Postgres, Redis and Files stores, see [storage.md](/self-hosting/storage); sets `features.datastore.enabled` |
+| `monitoring.enabled` | `true` | kube-prometheus-stack, ServiceMonitors, `ATOLL_BILLING_PROMETHEUS_URL` |
+| `monitoring.logs` | `true` | Loki and Alloy |
+| `monitoring.retention` | `15d` | Metrics and logs |
+| `monitoring.storage` / `logStorage` | `50Gi` / `50Gi` | Prometheus and Loki volumes |
+
+## Chart values
+
+Values of the chart in `deploy/helm/atoll`. Settings map to the server's environment variables; see `values.yaml` for every key.
+
+| Key | Env var | Default | Notes |
+|-----|---------|---------|-------|
+| `urls.public` | `ATOLL_PUBLIC_URL` | required | |
+| `urls.panel` | `ATOLL_PANEL_URL` | public URL | Must not be under `urls.appsDomain` (checked), see [Panel host](#panel-host) |
+| `urls.appsDomain` | `ATOLL_APPS_DOMAIN` | required | |
+| `urls.appsScheme` | `ATOLL_APPS_SCHEME` | `https` | |
+| `urls.internal` | `ATOLL_INTERNAL_URL` | Service DNS name, port 8081 | How build pods reach the server's internal port (`ATOLL_INTERNAL_PORT=8081`), which serves only the build protocol |
+| `image.*`, `imagePullSecrets` | | `atoll/server:<appVersion>` | Pull secrets also go to the `helm test` pod |
+| `auth.accounts` | | `true` | The server has a database, so users sign in and ATOLL_TOKEN is ignored. `false` for servers without accounts |
+| `auth.allowOpen` | | `false` | Without accounts, the chart refuses to install unless `apiToken` is set or this is `true` (test clusters) |
+| `apiToken.existingSecret/key` | `ATOLL_TOKEN` | empty | Only for servers without accounts |
+| `server.replicas` | | `2` | PDB `minAvailable: 1` when > 1 |
+| `server.resources`, `javaOpts` | `JAVA_OPTS` | 768Mi/1.5Gi, 75% heap | |
+| `server.extraEnv`, `extraEnvFromSecrets` | | | Escape hatch for other settings |
+| `server.scratchSize` | | `8Gi` | `sizeLimit` of the server's scratch volume; uploads pass through it. Keep it above a source upload (500 MB) plus `limits.buildOutputBytes` per build uploading at once, or the kubelet evicts the pod |
+| `namespaces.create`, `.builds`, `.apps` | `ATOLL_BUILD_NAMESPACE`, `ATOLL_APPS_NAMESPACE` | `true`, `atoll-builds`, `atoll-apps` | Namespaces are kept on uninstall |
+| `namespaces.domains` | `ATOLL_DOMAINS_NAMESPACE` | `atoll-domains` | Custom-domain Ingresses, TLS Secrets and ExternalName Services; the chart creates `atoll-server` there |
+| `namespaces.storage` | `ATOLL_DATASTORE_NAMESPACE` | `atoll-storage` | Users' stores; created only with `features.datastore.enabled` |
+| `namespaces.podSecurity` | | `restricted` | Builds, apps and domains namespaces |
+| `namespaces.storagePodSecurity` | | `baseline` | Storage namespace (warns on `restricted`); the Files SeaweedFS chart can't meet `restricted` |
+| `builds.image` | `ATOLL_BUILDER_IMAGE` | `atoll/builder:latest` | |
+| `builds.cpu` / `memory` | `ATOLL_BUILD_CPU` / `_MEMORY` | `2` / `6Gi` | |
+| `builds.timeoutSeconds` | `ATOLL_BUILD_TIMEOUT` | `1800` | |
+| `builds.maxPerReplica` | `ATOLL_MAX_BUILDS` | `2` | |
+| `builds.runtimeClass.name/create/handler` | `ATOLL_BUILD_RUNTIME_CLASS` | empty | |
+| `builds.nodeSelector` / `tolerations` | `ATOLL_BUILD_NODE_SELECTOR` / `_TOLERATIONS` | `{}` / `[]` | Passed to build pods as JSON; see [install.md](/self-hosting/install#keep-builds-on-their-own-nodes) |
+| `limits.projectStorageBytes` | `ATOLL_PROJECT_STORAGE_QUOTA_BYTES` | 20 GiB | New deployments are refused while a project stores more; `0` turns it off |
+| `limits.buildOutputBytes` / `buildFileBytes` / `buildSiteFiles` | `ATOLL_BUILD_MAX_OUTPUT_BYTES` / `_FILE_BYTES` / `_SITE_FILES` | 2 GiB / 1 GiB / 20000 | What one build may upload (web apps counted unpacked) |
+| `postgres.url` | `ATOLL_DATABASE_URL` | bundled or required | |
+| `postgres.user` or `userKey` | `ATOLL_DATABASE_USER` | `atoll` | `userKey: username` for CloudNativePG secrets |
+| `postgres.existingSecret/passwordKey` | `ATOLL_DATABASE_PASSWORD` | `atoll-postgres`/`password` | |
+| `storage.bucket/endpoint/region/pathStyle` | `ATOLL_STORAGE_*` | `atoll`, bundled, `us-east-1`, auto | `pathStyle: false` is passed through (virtual-host buckets) |
+| `storage.existingSecret/accessKeyKey/secretKeyKey` | `ATOLL_STORAGE_ACCESS_KEY` / `_SECRET_KEY` | `atoll-storage` | Empty secret uses the AWS default chain |
+| `registry.push` / `pull` | `ATOLL_REGISTRY_PUSH` / `_PULL` | bundled or required / push | |
+| `registry.insecure` | `ATOLL_REGISTRY_INSECURE` | `false` | |
+| `registry.pushSecret` | `ATOLL_REGISTRY_PUSH_SECRET` | empty | Build pods push with it, [registry.md](/self-hosting/registry) |
+| `registry.pullSecret` | `ATOLL_REGISTRY_PULL_SECRET` | empty | `imagePullSecrets` of app pods |
+| `registry.builderPullSecret` | `ATOLL_BUILDER_PULL_SECRET` | empty | `imagePullSecrets` of build pods |
+| `ingress.className` | `ATOLL_INGRESS_CLASS` | `traefik` | |
+| `ingress.trustForwarded` | `ATOLL_AUTH_TRUST_FORWARDED` | `true` | Client IP and scheme from the controller's `X-Forwarded-*` headers; only set while `ingress.enabled` |
+| `ingress.panelService.name/port` | | empty / `80` | Service with the panel's static files on the panel host |
+| `ingress.controller` | | `traefik` | `traefik`, `nginx` or `other`: controller-specific annotations |
+| `ingress.controllerNamespace/Ports` | | `traefik`, `[8000, 8443]` | Network policies admit traffic from there |
+| `ingress.serverAnnotations/sitesAnnotations` | | | e.g. `cert-manager.io/cluster-issuer` |
+| `ingress.tls.serverSecret/appsSecret` | | `""`/`atoll-apps-wildcard-tls` | |
+| `certManager.wildcardCertificate.*` | | off | Certificate for `*.<appsDomain>` |
+| `certManager.traefikDefaultCertificate` | | `true` | TLSStore `default` with the wildcard |
+| `features.env.keysSecret/keysKey` | `ATOLL_ENV_KEYS` | `atoll-env` / `ATOLL_ENV_KEYS` | Required. Value `k1:<openssl rand -base64 32>`; list `k2:<new>,k1:<old>` to rotate |
+| `features.runners.sealKeySecret/sealKeyKey` | `ATOLL_RUNNERS_SEAL_KEY` | the env keys Secret / `ATOLL_RUNNERS_SEAL_KEY` | Required. Value `<openssl rand -base64 32>`; encrypts [build runner](/self-hosting/runners) jobs' env vars |
+| `features.*` | `ATOLL_<AREA>_*` | | See below |
+| `rbac.metrics` | | `true` | Read pod metrics in the apps namespace (billing) |
+| `rbac.certManager` | | `true` | Custom domains: Ingresses, ExternalName Services, Certificates (read) and TLS Secrets (delete), only in the domains namespace |
+| `features.domains.ingressAnnotations` | `ATOLL_DOMAINS_INGRESS_ANNOTATIONS` | `{}` | Extra annotations on domain Ingresses |
+| `features.scaling.scaleToZero` | `ATOLL_SCALING_SCALE_TO_ZERO` | `keda` | `keda` or `off`; with `keda` the server may manage HTTPScaledObjects and app pods accept the interceptor |
+| `features.scaling.kedaNamespace` / `interceptor` | `ATOLL_SCALING_INTERCEPTOR` | `keda` / empty | Where KEDA's HTTP add-on runs; empty `interceptor` is its proxy Service in that namespace, port 8080 |
+| `features.datastore.enabled` | `ATOLL_DATASTORE_ENABLED` | `true` | Storage namespace, Role, policies and settings; off makes the server say storage is turned off ([storage.md](/self-hosting/storage)) |
+| (release namespace) | `ATOLL_DATASTORE_SERVER_NAMESPACE` | | Store network policies admit atoll-server from here |
+| `features.datastore.storageClass` | `ATOLL_DATASTORE_STORAGE_CLASS` | cluster default | Store volumes; resizing needs `allowVolumeExpansion` |
+| `features.datastore.backups.endpoint/region/bucket/secret` | `ATOLL_DATASTORE_BACKUP_ENDPOINT` / `_REGION` / `_BUCKET` / `_SECRET` | Files S3 / `us-east-1` / `atoll-store-backups` / `atoll-store-backups` | Where Postgres stores archive WAL and base backups; the Secret is in the storage namespace (`ACCESS_KEY_ID`, `ACCESS_SECRET_KEY`) of every region |
+| `features.datastore.files.service/port` | | `atoll-files-s3` / `8333` | Service of the Files SeaweedFS in the storage namespace |
+| `features.datastore.files.endpoint` | `ATOLL_DATASTORE_FILES_ENDPOINT` | `http://atoll-files-s3.atoll-storage.svc:8333` | |
+| `features.datastore.files.publicEndpoint` | `ATOLL_DATASTORE_FILES_PUBLIC_ENDPOINT` | `<appsScheme>://s3.<appsDomain>` | |
+| `features.datastore.files.region` | `ATOLL_DATASTORE_FILES_REGION` | `us-east-1` | |
+| `features.datastore.files.existingSecret/accessKeyKey/secretKeyKey` | `ATOLL_DATASTORE_FILES_ACCESS_KEY` / `_SECRET_KEY` | `atoll-files-admin` / `access-key` / `secret-key` | S3 admin keys; optional, without them only Files stores fail |
+| `features.datastore.files.ingress.enabled/annotations` | | `true` / `{}` | Ingress for `s3.<appsDomain>` in the storage namespace |
+| `rbac.storageExtraRules` | | `[]` | Extra rules for the server's Role in the storage namespace |
+| `rbac.storageClasses` | | `true` | ClusterRole to read StorageClasses (get), so resizes are refused up front where volumes can't grow |
+| `networkPolicy.storage.operatorNamespace` | | `cnpg-system` | CloudNativePG operator, admitted on 5432 and 8000 |
+| `networkPolicy.storage.monitoringNamespaces/metricsPorts` | | `[]` / `[9187, 9121, 9327]` | Who may scrape store metrics |
+| `networkPolicy.*` | | on | See below |
+| `postgres.bundled`, `storage.bundled`, `registry.bundled` | | off | Single-pod Postgres 18, SeaweedFS, zot for evaluation |
+| `registry.bundled.htpasswdSecret` | | empty | Empty: the chart generates the users once (Secret `atoll-registry-auth`, kept on uninstall) and the push/pull dockerconfigjson Secrets |
+| `registry.bundled.nodeAccess.*` | | off | NodePort for node pulls (kind/k3d) and the source CIDRs its NetworkPolicy admits |
+
+Server permissions, by namespace:
+
+| Namespace | Allowed |
+|-----------|---------|
+| builds | Jobs (create, delete, watch), pods and logs (read), Secrets (get, create, delete: one env Secret per build) |
+| apps | Deployments, Services, Ingresses, HPAs and, with scale to zero, HTTPScaledObjects (manage), pods (read), pod metrics (read), Secrets (get, create, update, patch, delete; never list: one `<app>-env` Secret per app, owned by its Deployment) |
+| domains | Ingresses and Services (manage), Certificates (read), Secrets (delete) |
+| storage | Secrets, Services, PVCs, StatefulSets, NetworkPolicies, CloudNativePG Clusters and ScheduledBackups, Barman Cloud ObjectStores (manage), CloudNativePG Backups and Jobs (list), pods (read, delete; no exec); cluster-wide StorageClasses (get) |
+
+### Feature settings
+
+Each platform feature reads its own `ATOLL_<AREA>_*` variables. The chart passes them through without knowing
+them, so new settings need no chart change:
+
+```yaml
+features:
+  auth:
+    config:                       # plain values; keys must start with ATOLL_AUTH_
+      ATOLL_AUTH_GITHUB_CLIENT_ID: Iv1.abc
+    existingSecret: atoll-auth    # every key becomes an env var (client secrets, SMTP password)
+  env:
+    keysSecret: atoll-env         # holds ATOLL_ENV_KEYS=k1:<openssl rand -base64 32>, always required
+  domains:
+    clusterIssuer: letsencrypt    # ATOLL_DOMAINS_CLUSTER_ISSUER
+  billing:
+    prometheusUrl: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090  # ATOLL_BILLING_PROMETHEUS_URL
+    existingSecret: atoll-billing
+  git:
+    existingSecret: atoll-git
+```
+
+The chart refuses a `config` key without the area's prefix, which catches typos.
+
+### Panel host
+
+The panel signs in with the `atoll_session` cookie, set host-only on the panel host (`Secure` when
+`urls.panel` is https), and calls `/api` on that same host. Two rules follow:
+
+- The panel host (and the API host) must not be `urls.appsDomain` or below it. Apps under the wildcard run user
+  code and could set cookies for a parent domain they share with the panel. The chart fails the install
+  otherwise. Prefer an apps domain on a different registrable domain altogether.
+- If the panel gets its own host (`urls.panel` different from `urls.public`), the chart adds it to the
+  `atoll-server` Ingress. atoll-server serves the panel's static files itself, so by default the whole host
+  goes to it; `ingress.panelService` can send everything but `/api` to a separate Service instead.
+
+Behind the ingress the server trusts `X-Forwarded-For`/`-Proto` (`ATOLL_AUTH_TRUST_FORWARDED=true`) for
+client IPs (rate limits, audit) and the https scheme. That is safe because Traefik overwrites those headers
+from clients it does not trust, and the `atoll-server` NetworkPolicy keeps everything but the controller and
+the release namespace away from the API port. Build pods run untrusted code and could send any header, so they
+only reach the internal port 8081, which serves the build protocol (`/internal`) and nothing else; `/internal`
+in turn answers 404 on the API port.
+
+### Network policies
+
+| Policy | Effect |
+|--------|--------|
+| `atoll-builds` | Build pods accept nothing; egress only to DNS, atoll-server:8081 (build protocol), the bundled registry, the ingress controller (`networkPolicy.builds.allowIngressController`, needed when the registry is behind it) and port 443 on public IPs |
+| `atoll-apps` | App pods accept traffic only from the ingress controller namespace (8080, and 8089 for cert-manager solvers) and, with scale to zero, KEDA's interceptor (8080). Egress: DNS, the ingress controller (`networkPolicy.apps.allowIngressController`) and any port on public IPs; never private ranges, CGNAT, link-local (cloud metadata `169.254.169.254`), loopback or multicast |
+| `atoll-server` | Port 8080 (API) accepts its own namespace, the ingress controller and `networkPolicy.server.extraNamespaces`; port 8081 (build protocol) only build pods |
+| `atoll-postgres`, `atoll-storage` | Bundled database and storage accept only the server |
+| `atoll-stores` | Users' stores accept their own namespace, the server (5432, 6379, 8333), the CloudNativePG operator (5432, 8000), monitoring (metrics) and, on the Files S3 port 8333, app pods and the ingress controller. Postgres and Redis admit connected projects' app pods through per-store policies the server keeps; `atoll-apps` egress allows the storage namespace on 5432, 6379 and 8333 |
+| `atoll-registry` | Bundled registry accepts build pods and, with `nodeAccess`, the listed node CIDRs |
+| `atoll-db` (helmfile) | CloudNativePG accepts the server, its replicas, the operator and Prometheus |
+| SeaweedFS (helmfile) | Components accept each other; from outside only S3 (8333) from atoll-server and zot, and metrics from Prometheus |
+| `zot` (helmfile) | Only the ingress controller (pushes and node pulls both go through Traefik) |
+| `monitoring-*` (helmfile) | Monitoring pods accept only Grafana, Prometheus, Alertmanager and Alloy; Grafana also the ingress controller, Prometheus also atoll-server (billing). The operator is left open for the API server's webhook calls. Loki runs without multi-tenancy, so tenants must never reach it |
+
+k3s enforces them with its built-in controller. Other clusters need a CNI that enforces NetworkPolicies.
+Egress is restricted for build and app pods (untrusted code); platform components keep open egress.
+
+### Ingress controllers
+
+Traefik is the default. Two details are handled by the chart:
+
+- Traefik ranks routers by rule length, and the wildcard rule `*.apps...` is longer than short exact hosts, so
+  the wildcard `atoll-sites` Ingress gets `router.priority: 1` and app Ingresses always win.
+- App Ingresses have TLS without a secret. A Traefik `TLSStore` named `default` serves the wildcard certificate
+  for them (`certManager.traefikDefaultCertificate`).
+
+With `ingress.controller: nginx` the chart adds ingress-nginx annotations (512m uploads, 300 s timeouts)
+instead; set the wildcard certificate as `--default-ssl-certificate`. ingress-nginx no longer gets security
+fixes, so prefer Traefik.

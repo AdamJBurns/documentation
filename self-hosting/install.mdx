@@ -1,0 +1,251 @@
+---
+title: "Install"
+description: "Install the platform step by step, from bare nodes to a working API."
+---
+Read [requirements.md](/self-hosting/requirements) first. Commands run on your admin machine unless they say otherwise;
+paths are relative to the repository root.
+
+## 1. Install k3s
+
+On the first server node, as root:
+
+```sh
+scp -r deploy/selfhost/k3s root@node1:/opt/atoll-k3s
+ssh root@node1 'TLS_SAN=k8s.example.com /opt/atoll-k3s/install.sh server-init'
+ssh root@node1 cat /var/lib/rancher/k3s/server/token
+```
+
+`install.sh` pins the k3s version (`K3S_VERSION`, default `v1.36.5+k3s1`), sets kernel limits for builds and
+copies `k3s/config.yaml`, which disables k3s' bundled Traefik, ServiceLB and metrics-server (the helmfile
+installs its own) and encrypts Secrets at rest. k3s' network policy controller stays on; the platform relies on it.
+
+Join two more servers for a highly available control plane (etcd needs 1 or 3 servers), then any agents:
+
+```sh
+ssh root@node2 'K3S_URL=https://node1:6443 K3S_TOKEN=<token> /opt/atoll-k3s/install.sh server'
+ssh root@node4 'K3S_URL=https://node1:6443 K3S_TOKEN=<token> /opt/atoll-k3s/install.sh agent'
+```
+
+Copy `/etc/rancher/k3s/k3s.yaml` from node1 to `~/.kube/config` on your machine, replace `127.0.0.1` with the
+node (or `TLS_SAN`) address, and check:
+
+```sh
+kubectl get nodes
+```
+
+## 2. Optional: gVisor for builds
+
+Builds run untrusted Gradle code. For a stronger sandbox install `runsc` and `containerd-shim-runsc-v1` on
+every node that runs builds ([gVisor install](https://gvisor.dev/docs/user_guide/install/)) and register the
+runtime with k3s' containerd. k3s ships containerd 2, whose config is version 3: copy the generated
+`/var/lib/rancher/k3s/agent/etc/containerd/config.toml` to `config-v3.toml.tmpl` in the same directory and
+append:
+
+```toml
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]
+  runtime_type = "io.containerd.runsc.v1"
+```
+
+(k3s releases still on containerd 1.x read `config.toml.tmpl` with the section
+`[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]`.) Restart k3s
+(`systemctl restart k3s` or `k3s-agent`), check with `crictl info | grep runsc`, and set `atoll.gvisor: true`
+in your site values (step 4). The chart then creates the `gvisor` RuntimeClass and sets
+`ATOLL_BUILD_RUNTIME_CLASS`.
+
+### Keep builds on their own nodes
+
+Recommended whenever people you don't fully trust can deploy: give builds a node pool of their own, so a build
+that escapes its container (or just eats its node's disk and memory) never lands next to atoll-server, Postgres
+or the object storage. Label and taint the build nodes when you join them (or later with `kubectl`):
+
+```sh
+kubectl label node <build-node> atoll.app/pool=builds
+kubectl taint node <build-node> atoll.app/builds=true:NoSchedule
+```
+
+The taint keeps everything else off them; build pods tolerate it and select the label. In your site values:
+
+```yaml
+atoll:
+  gvisor: true          # install runsc on the build nodes only
+  buildNodeSelector: {atoll.app/pool: builds}
+  buildTolerations: [{key: atoll.app/builds, operator: Exists, effect: NoSchedule}]
+```
+
+The chart passes them to the server as `ATOLL_BUILD_NODE_SELECTOR` and `ATOLL_BUILD_TOLERATIONS` (JSON), which
+puts them on every build pod. Builds wait ("Waiting for cluster capacity") while no build node is free.
+
+## 3. Images
+
+The release workflow publishes `ghcr.io/new-horizon-code-repo/atoll-server` and `atoll-builder`; the site
+values use them by default. To run your own build instead:
+
+```sh
+docker build -f deploy/server/Dockerfile -t <registry>/atoll-server:<tag> .
+docker build -f deploy/builder/Dockerfile -t <registry>/atoll-builder:<tag> .
+```
+
+and set `atoll.image`, `atoll.tag` and `atoll.builderImage` (plus `atoll.imagePullSecret` if the registry is
+private). After step 6 you can also push them to `registry.example.com/platform/` with the zot `admin` user.
+
+## 4. Site values
+
+```sh
+cp deploy/selfhost/environments/default.yaml my-site.yaml
+```
+
+Edit `my-site.yaml` (every key is explained in [configuration.md](/self-hosting/configuration)):
+
+- `domains`: API, apps, registry and Grafana hosts.
+- `tls.email`, `tls.dns01.provider` and its settings. Start with `tls.acmeServer` set to Let's Encrypt staging
+  until certificates are issued, then switch to production.
+- `metallb.addresses`: free IPs on the node network; `ingress.loadBalancerIP` to pin one of them.
+- `postgres.backup`: the off-site bucket.
+- `atoll.image`, `atoll.tag`, `atoll.builderImage`.
+
+Keep `my-site.yaml` in your own (private) repository; it holds no secrets.
+
+## 5. Secrets
+
+```sh
+export REGISTRY_HOST=registry.example.com
+export CLOUDFLARE_API_TOKEN=...            # or RFC2136_TSIG_SECRET=...
+export BACKUP_S3_ACCESS_KEY_ID=... BACKUP_S3_SECRET_ACCESS_KEY=...
+deploy/selfhost/scripts/create-secrets.sh
+```
+
+The script creates the namespaces (`atoll-builds`, `atoll-apps`, `atoll-domains` and `atoll-storage` enforce the
+`restricted` Pod Security Standard) and these Secrets, generating random passwords where needed. It never overwrites an
+existing Secret, so it is safe to re-run.
+
+| Secret | Holds |
+|--------|-------|
+| `atoll/atoll-env` | `ATOLL_ENV_KEYS=k1:<key>`, the AES-256 key that encrypts project env vars, and `ATOLL_RUNNERS_SEAL_KEY=<key>`, which encrypts build runner jobs' env vars (both required: the server does not start with a database and no keys). Back them up: without `ATOLL_ENV_KEYS` stored env vars are lost |
+| `atoll/atoll-storage`, `registry/zot-s3`, `seaweedfs/seaweedfs-s3-config` | S3 users `atoll` (bucket `atoll`) and `registry` (bucket `atoll-registry`), each limited to its bucket |
+| `registry/zot-users`, `registry/zot-htpasswd` | Registry passwords (`push`, `pull`, `admin`) and their bcrypt file |
+| `atoll-builds/atoll-registry-push` | Push credentials for build pods |
+| `atoll-builds/atoll-registry-pull`, `atoll-apps/atoll-registry-pull`, `atoll/atoll-platform-pull` | Pull credentials (builder image, app images, server image) |
+| `cert-manager/cloudflare-api-token` or `cert-manager/rfc2136-tsig` | DNS-01 credentials |
+| `atoll/atoll-backup-s3` | Backup bucket keys |
+| `monitoring/grafana-admin` | Grafana admin password |
+| `atoll/atoll-files-admin`, `atoll-storage/atoll-store-backups`, `atoll-storage/atoll-files-s3-config` | Users' stores: S3 admin of the Files SeaweedFS, Postgres backup keys and the S3 identities made from them ([storage.md](/self-hosting/storage#secrets)); skipped with `STORAGE=false` |
+
+To create the env key by hand instead (any id of letters, digits, `_.-`; the first listed key encrypts new
+values, the others only decrypt, which is how keys are rotated: `k2:<new>,k1:<old>`):
+
+```sh
+kubectl -n atoll create secret generic atoll-env --from-literal=ATOLL_ENV_KEYS="k1:$(openssl rand -base64 32)" \
+  --from-literal=ATOLL_RUNNERS_SEAL_KEY="$(openssl rand -base64 32)"
+```
+
+Accounts, OAuth, email, billing and Git settings that are secret go into Secrets you create yourself, named in
+`atoll.values.features.<area>.existingSecret` (see [configuration.md](/self-hosting/configuration#feature-settings)).
+
+## 6. Install everything
+
+```sh
+cd deploy/selfhost
+helmfile -e default --state-values-file ../../my-site.yaml sync
+```
+
+helmfile installs, in order: MetalLB and its pool, kube-prometheus-stack (if monitoring), cert-manager and the
+ClusterIssuers, Traefik, metrics-server, CloudNativePG and the Barman Cloud plugin, SeaweedFS (mTLS and JWT
+between its components), zot, the network policies of the registry and monitoring namespaces, the `atoll-db`
+Postgres cluster, Loki and Alloy (if logs) and finally the platform. Every release waits until it is ready.
+A first install takes 10-15 minutes.
+
+Upgrading an install made before the S3 users were split? Delete `seaweedfs/seaweedfs-s3-config`, re-run
+`create-secrets.sh` (it keeps the existing keys) and restart the filer: `kubectl -n seaweedfs rollout restart
+statefulset/seaweedfs-filer`.
+
+For later changes use `helmfile ... apply` (needs the [helm-diff](https://github.com/databus23/helm-diff)
+plugin: `helm plugin install https://github.com/databus23/helm-diff`), which shows and applies only what changed.
+
+## 7. Check
+
+```sh
+kubectl -n traefik get svc traefik                      # EXTERNAL-IP: create the DNS records for it
+kubectl get certificate -A                              # all READY=True after DNS has propagated
+kubectl -n atoll get cluster.postgresql.cnpg.io atoll-db # "Cluster in healthy state"
+kubectl -n atoll rollout status deployment/atoll-server
+helm test atoll -n atoll
+curl https://atoll.example.com/api/health
+```
+
+Then sign up in the panel at `https://atoll.example.com`, create a personal access token and point the CLI at
+it (`ATOLL_SERVER`, `atoll login`). With a database the server has accounts, so there is no static API token.
+
+## Custom domains
+
+Every custom domain gets an Ingress and TLS Secret in `atoll-domains` (see [docs/domains.md](/reference/domains)).
+Web app domains route to the ExternalName Service `atoll-server` there (the chart creates it), Ktor app domains
+to an ExternalName Service the server creates per domain, leading to the app's Service. Traefik's
+`allowExternalNameServices` is on for that. Tell users where to point their DNS with `ATOLL_DOMAINS_CNAME_TARGET` (default
+`cname.<apps domain>`, which needs a DNS record at the Traefik IP) and `ATOLL_DOMAINS_A_RECORDS` (the public IP,
+for apex domains), set through `atoll.values.features.domains.config`.
+
+## Rehearse locally
+
+`deploy/selfhost/local/k3d.sh` runs the same helmfile on a local [k3d](https://k3d.io) cluster with
+`environments/local.yaml` (self-signed CA, single replicas, no MetalLB or backups):
+
+```sh
+docker build -f deploy/server/Dockerfile -t atoll/server:selfhost-test .
+deploy/selfhost/local/k3d.sh up
+deploy/selfhost/local/k3d.sh install                                          # add --state-values-set monitoring.enabled=true for the monitoring stack
+deploy/selfhost/local/k3d.sh check      # {"status":"ok",...}
+deploy/selfhost/local/k3d.sh down
+```
+
+Storage is installed too (`--state-values-set datastore.enabled=false` leaves it out); its volumes use
+`local-path`, so store resizes are refused locally ([storage.md](/self-hosting/storage#disks-and-resizing)). `e2e/storage.sh`
+tests stores end to end on its own k3d cluster.
+
+Traefik listens on `localhost:8480` (HTTP) and `localhost:8443` (HTTPS). Nodes cannot resolve
+`registry.atoll.localhost`, so app images do not deploy in this setup; it checks the platform install.
+
+## Without the helmfile
+
+The chart works on any cluster that has an ingress controller, Postgres, S3 storage and a registry:
+
+```sh
+helm install atoll deploy/helm/atoll -n atoll --create-namespace -f my-atoll-values.yaml
+```
+
+For a single-node evaluation it can also run Postgres, SeaweedFS and zot itself
+(`postgres.bundled.enabled`, `storage.bundled.enabled`, `registry.bundled.enabled`); see
+`deploy/helm/atoll/ci/bundled-values.yaml`. Those are single pods without backups. Create `atoll-env`
+(above), `atoll-postgres` (`password`) and `atoll-storage` (`access-key`, `secret-key` and `s3.json`, the
+SeaweedFS user list with the same keys) first.
+
+The bundled zot always requires a login. The chart generates its users once (`atoll-registry-auth`) and the
+push and pull Secrets for the builds and apps namespaces. Build pods push to
+`atoll-registry.<namespace>.svc.cluster.local:5000`, a name node container runtimes cannot resolve, so nodes
+need a containerd mirror for it pointing at a NodePort (`registry.bundled.nodeAccess`):
+
+- **k3d**: `deploy/selfhost/local/k3d.sh up` creates the cluster with this `registries.yaml`
+  (`BUNDLED_NAMESPACE` picks the namespace):
+
+  ```yaml
+  mirrors:
+    "atoll-registry.atoll.svc.cluster.local:5000":
+      endpoint: ["http://localhost:30500"]
+  ```
+
+- **kind**: create the cluster with `containerdConfigPatches` setting `config_path = "/etc/containerd/certs.d"`
+  (see [docs/kubernetes.md](/self-hosting/kubernetes)), then on every node:
+
+  ```sh
+  for node in $(kind get nodes --name atoll); do
+    dir=/etc/containerd/certs.d/atoll-registry.atoll.svc.cluster.local:5000
+    docker exec "$node" mkdir -p "$dir"
+    printf '[host."http://localhost:30500"]\n  capabilities = ["pull", "resolve"]\n' |
+      docker exec -i "$node" sh -c "cat > $dir/hosts.toml"
+  done
+  ```
+
+Node pulls through `localhost:30500` reach the registry from the node's pod-network gateway (`10.42.0.1` on
+a single-node k3s/k3d; on kind the `.1` of the node's pod CIDR, see `kubectl get node -o
+jsonpath='\{.items[*].spec.podCIDR\}'`); list it in `registry.bundled.nodeAccess.allowedCIDRs`, or the
+registry's NetworkPolicy drops them. New pods may need a few seconds before k3s' network policy controller
+lets them connect.

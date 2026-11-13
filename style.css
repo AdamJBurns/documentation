@@ -1,0 +1,212 @@
+/*
+ * Atoll look on top of Mintlify's Luma theme: one top bar with the tabs beside the logo and search in the middle,
+ * a plain sidebar, and the panel palette (atoll-main/panel/src/styles.css): neutral greys, blue for primary actions.
+ * Mintlify utilities are layered and some are !important, so a few overrides go through min-width and margins.
+ */
+
+/* Mona Sans comes from Google Fonts through docs.json. Code uses Geist Mono (SIL OFL, see /fonts/OFL.txt). */
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/fonts/geist-mono-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url("/fonts/geist-mono-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Panel tokens, light. Mintlify's greys are blue-tinted; these are the panel's neutral ones. */
+:root {
+  --gray-50: 245 245 244;
+  --gray-100: 237 237 236;
+  --gray-200: 226 226 223;
+  --gray-300: 208 208 205;
+  --gray-400: 160 160 156;
+  --gray-500: 114 114 110;
+  --gray-600: 82 82 79;
+  --gray-700: 61 61 58;
+  --gray-800: 38 38 38;
+  --gray-900: 23 23 23;
+  --gray-950: 12 12 12;
+
+  --font-family-mono-custom: "Geist Mono";
+
+  --atoll-ink: #151515;
+  --atoll-ink-soft: #3d3d3a;
+  --atoll-muted: #6b6b66;
+  --atoll-line: #e8e8e5;
+  --atoll-field: #ffffff;
+  --atoll-field-line: #e4e4e1;
+  --atoll-chip: #f5f5f4;
+  --atoll-card: #ffffff;
+  --atoll-card-line: #e4e4e1;
+  --atoll-active: #1f56d0;
+  --atoll-primary: #1f56d0;
+  --atoll-primary-hover: #2563eb;
+  --atoll-primary-shadow: inset 0 1px 0 #ffffff3d, 0 1px 2px #1f56d04d, 0 3px 8px -3px #1f56d066;
+  --atoll-selection: #2563eb29;
+}
+
+/* Panel tokens, dark. */
+html.dark {
+  --atoll-ink: #ededed;
+  --atoll-ink-soft: #c4c4c4;
+  --atoll-muted: #8e8e8e;
+  --atoll-line: #232323;
+  --atoll-field: #131313;
+  --atoll-field-line: #2e2e2e;
+  --atoll-chip: #262626;
+  --atoll-card: #111111;
+  --atoll-card-line: #262626;
+  --atoll-active: #7aa7fb;
+  --atoll-primary: #2563eb;
+  --atoll-primary-hover: #3b74f0;
+  --atoll-primary-shadow: inset 0 1px 0 #ffffff2e, 0 1px 2px #00000080;
+  --atoll-selection: #60a5fa33;
+}
+
+::selection { background: var(--atoll-selection); }
+code, kbd, samp, pre { font-family: "Geist Mono", ui-monospace, Consolas, monospace; }
+
+/* Top bar: logo, then the tabs, search in the middle, links and the primary button on the right. */
+#navbar .h-12 > div:first-child { flex: none; }
+#navbar .h-12 > nav {
+  align-self: stretch;
+  justify-content: flex-start;
+  padding-left: 20px;
+}
+#navbar .h-12 > nav ul,
+#navbar .h-12 > nav li { height: 100%; }
+#navbar .h-12 > nav a.link {
+  height: 100%;
+  margin: 0 10px;
+  padding: 0 2px;
+  border-radius: 0;
+  background: none;
+  color: var(--atoll-muted);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+#navbar .h-12 > nav a.link:hover { color: var(--atoll-ink); }
+#navbar .h-12 > nav a.link[aria-current] {
+  color: var(--atoll-active);
+  box-shadow: inset 0 -2px 0 var(--atoll-active);
+}
+
+@media (min-width: 1200px) {
+  #navbar .topbar-right-container > div:has(> #search-bar-entry) {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  #search-bar-entry {
+    min-width: 340px;
+    height: 34px;
+    border-radius: 9px;
+    border: 1px solid var(--atoll-field-line);
+    background: var(--atoll-field);
+    color: var(--atoll-muted);
+  }
+  #search-bar-entry:hover { border-color: var(--atoll-muted); }
+  #search-bar-entry > div:first-child { margin: 0 auto 0 12px; }
+  #search-bar-entry .truncate { display: block; }
+  #search-bar-entry > span {
+    display: inline-block;
+    margin-right: 6px;
+    border-radius: 6px;
+    background: var(--atoll-chip);
+    color: var(--atoll-muted);
+    font-family: "Geist Mono", ui-monospace, monospace;
+    font-weight: 400;
+  }
+}
+
+#navbar .topbar-right-container a:not(#topbar-cta-button a) {
+  border-color: transparent;
+  background: none;
+  padding: 0 8px;
+  color: var(--atoll-muted);
+}
+#navbar .topbar-right-container a:not(#topbar-cta-button a):hover { color: var(--atoll-ink); }
+
+#topbar-cta-button a {
+  font-weight: 600;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: var(--atoll-primary);
+  box-shadow: var(--atoll-primary-shadow);
+  opacity: 1;
+}
+#topbar-cta-button a:hover { background: var(--atoll-primary-hover); opacity: 1; }
+#topbar-cta-button a,
+#topbar-cta-button a * { color: #ffffff; }
+
+/* Sidebar: muted group labels, plain links, the current page in the accent. */
+#sidebar-content { border-right: 1px solid var(--atoll-line); }
+#sidebar-content .sidebar-group-header {
+  color: var(--atoll-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+#sidebar-content .sidebar-group li > a {
+  color: var(--atoll-ink-soft);
+  font-size: 14px;
+  letter-spacing: -0.006em;
+}
+#sidebar-content .sidebar-group li > a:hover { color: var(--atoll-ink); }
+#sidebar-content .sidebar-group li[data-active="true"] > a { color: var(--atoll-active); }
+
+/* Page */
+#header .eyebrow { color: var(--atoll-muted); }
+#page-title { font-weight: 600; letter-spacing: -0.02em; }
+#content-area .prose { --tw-prose-body: var(--atoll-ink-soft); --tw-prose-invert-body: var(--atoll-ink-soft); }
+
+/* Cards: icon and title on one line, a rule, then the text. */
+.card {
+  border-radius: 10px;
+  border-color: var(--atoll-card-line);
+  background: var(--atoll-card);
+}
+.card [data-component-part="card-content-container"] {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  padding: 0;
+}
+.card [data-component-part="card-icon"] {
+  grid-column: 1;
+  grid-row: 1;
+  display: flex;
+  width: auto;
+  height: auto;
+  padding: 12px 10px 12px 16px;
+}
+.card [data-component-part="card-icon"] svg { width: 16px; height: 16px; }
+.card [data-component-part="card-icon"] + div { display: contents; }
+.card [data-component-part="card-title"] {
+  grid-column: 2;
+  grid-row: 1;
+  margin: 0;
+  padding: 12px 16px 12px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--atoll-ink);
+}
+.card:not(:has([data-component-part="card-icon"])) [data-component-part="card-title"] { padding-left: 16px; }
+.card [data-component-part="card-content"] {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  margin: 0;
+  padding: 14px 16px 16px;
+  border-top: 1px solid var(--atoll-card-line);
+  color: var(--atoll-ink-soft);
+  font-size: 15px;
+}

@@ -1,0 +1,125 @@
+---
+title: "Deploy a Ktor server"
+description: "This guide builds the smallest Ktor server the platform can deploy, puts it live, and gives it a database URL. It takes about ten minutes."
+---
+You need a JDK, the `atoll` CLI and an account. See [Getting started](/getting-started) for the CLI.
+
+## 1. Create the project
+
+Make a directory with three files:
+
+```text
+hello/
+├── settings.gradle.kts
+├── build.gradle.kts
+└── src/main/kotlin/Main.kt
+```
+
+`settings.gradle.kts`:
+
+```kotlin
+rootProject.name = "hello"
+
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+    }
+}
+```
+
+`build.gradle.kts`:
+
+```kotlin
+plugins {
+    kotlin("jvm") version "2.4.21"
+    application
+}
+
+application {
+    mainClass = "MainKt"
+}
+
+dependencies {
+    implementation("io.ktor:ktor-server-core:3.6.0")
+    implementation("io.ktor:ktor-server-netty:3.6.0")
+    implementation("ch.qos.logback:logback-classic:1.6.5")
+}
+```
+
+The `application` plugin and the `ktor-server` dependency are what tell the platform this module is a Ktor server.
+
+## 2. Listen on PORT
+
+`src/main/kotlin/Main.kt`:
+
+```kotlin
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.Netty
+import io.ktor.server.response.respondText
+import io.ktor.server.routing.get
+import io.ktor.server.routing.routing
+
+fun main() {
+    val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
+    embeddedServer(Netty, port = port) {
+        routing {
+            get("/") { call.respondText("Hello, world!") }
+        }
+    }.start(wait = true)
+}
+```
+
+The platform sets `PORT`. Locally, the server falls back to 8080.
+
+## 3. Add the Gradle wrapper
+
+The platform builds with your wrapper, so the project needs one:
+
+```sh
+gradle wrapper
+```
+
+Check that it runs locally:
+
+```sh
+./gradlew run
+```
+
+## 4. Deploy
+
+```sh
+atoll deploy
+```
+
+The CLI uploads the project, prints the build log and ends with:
+
+```text
+Deployment 3c9e41a0-5d2b-4f7e-9a61-0b8d2c7e4f15 READY
+
+  KTOR  :  READY  primary  https://hello.atoll.app/
+```
+
+The module path is `:` because the server is the root project. Open the URL.
+
+## 5. Add a database URL
+
+Set the URL as a secret that only the running server sees. It contains a password, so put it in a file instead of typing it on the command line, where it would end up in your shell history:
+
+```sh
+echo 'DATABASE_URL=postgres://user:password@db.example.com/hello' > .env.production
+atoll env import .env.production --secret --no-build
+rm .env.production
+```
+
+Read it in your server with `System.getenv("DATABASE_URL")`. Env var changes apply on the next deployment. Run `atoll deploy` again, or use **Redeploy production** in the panel's **Env** tab.
+
+## 6. Watch it
+
+- `atoll list` shows your deployments and their URLs.
+- `atoll logs 3c9e41a0` prints the build log again.
+- `atoll logs --project hello --follow` shows what your server prints while it runs, and so does the panel's **Logs** tab.
+
+## Next
+
+- [Full-stack Kotlin](/guides/full-stack-kotlin) adds a web app and an Android app to the same build.
+- [Custom domains](/configure/custom-domains) puts the server on your own domain.

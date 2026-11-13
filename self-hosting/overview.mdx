@@ -1,0 +1,62 @@
+---
+title: "Self-hosting the platform"
+sidebarTitle: "Overview"
+description: "This guide installs the platform on your own servers (bare metal or VMs) with k3s, one Helm chart for the platform and a helmfile for everything it depends on."
+---
+```
+                     DNS: atoll.example.com, *.apps.example.com, registry.example.com
+                                         │
+                          MetalLB IP (L2) ── Traefik (ingress, TLS)
+          ┌──────────────────┬───────────┴──────────┬────────────────────────┐
+     atoll-server ×2    *.apps → atoll-server   app Ingresses          zot registry
+     (namespace atoll)   (web apps)              (atoll-apps)          (namespace registry)
+          │                                          ▲                       ▲   ▲
+          ├── Postgres: CloudNativePG atoll-db ──► backups to off-site S3     │   │ pull (nodes)
+          ├── Object storage: SeaweedFS (S3 API)                              │   │
+          └── build Jobs (atoll-builds) ──────────────────── push ────────────┘   │
+                                               app pods (atoll-apps) ─────────────┘
+                                                     │
+                       users' stores (atoll-storage): Postgres (CNPG), Redis, Files (SeaweedFS, s3.apps)
+     cert-manager: Let's Encrypt HTTP-01 (hosts, custom domains) + DNS-01 (wildcard)
+     metrics-server (HPA, billing CPU/memory) · Prometheus + Grafana + Loki (optional)
+```
+
+| Page | Contents |
+|------|----------|
+| [requirements.md](/self-hosting/requirements) | Nodes, CPU/RAM/disk, DNS records, ports |
+| [install.md](/self-hosting/install) | Step-by-step install, from bare nodes to a working API |
+| [configuration.md](/self-hosting/configuration) | Every setting of the chart and the helmfile |
+| [registry.md](/self-hosting/registry) | Registry choice, authentication design and the server changes it needs |
+| [storage.md](/self-hosting/storage) | Users' Postgres, Redis and Files stores: what is installed, Secrets, the public S3 host, turning it off |
+| [firewall.md](/self-hosting/firewall) | atoll-edge (the project Firewall): components, settings, OWASP, regions, geolocation, troubleshooting |
+| [backups.md](/self-hosting/backups) | What to back up, how, and how to restore |
+| [upgrades.md](/self-hosting/upgrades) | Upgrading the platform, dependencies and k3s |
+| [monitoring.md](/self-hosting/monitoring) | Metrics, logs, dashboards and alerts |
+| [troubleshooting.md](/self-hosting/troubleshooting) | Common failures and how to fix them |
+
+## What is where
+
+| Path | What |
+|------|------|
+| `deploy/helm/atoll` | Helm chart for the platform itself: namespaces, RBAC, config, server, ingress, network policies, optional bundled Postgres/SeaweedFS/zot for evaluation |
+| `deploy/selfhost/helmfile.yaml.gotmpl` | Every release in install order, the platform included |
+| `deploy/selfhost/environments/` | `default.yaml` (production template) and `local.yaml` (k3d rehearsal) |
+| `deploy/selfhost/values/` | Values of each dependency |
+| `deploy/selfhost/charts/` | Small local charts: MetalLB pool, ClusterIssuers, the CloudNativePG cluster, network policies of the registry and monitoring namespaces |
+| `deploy/selfhost/k3s/` | k3s install script and config |
+| `deploy/selfhost/scripts/create-secrets.sh` | Creates namespaces and all Secrets (storage ones through `create-storage-secrets.sh`) |
+| `deploy/selfhost/local/k3d.sh` | Rehearse the whole install on a local k3d cluster |
+
+## Component choices
+
+| Need | Choice | Why |
+|------|--------|-----|
+| Kubernetes | k3s | Single binary, embedded etcd for HA, easy on bare metal and small VMs |
+| Load balancer | MetalLB (L2) | Gives the ingress a stable IP on bare metal without a cloud |
+| Ingress | Traefik | ingress-nginx was retired in March 2026 (no more fixes). Traefik is maintained, handles Ingress and Gateway API, and is k3s' default |
+| Certificates | cert-manager | HTTP-01 for single hosts and users' custom domains, DNS-01 (Cloudflare or RFC2136) for `*.apps` |
+| Postgres | CloudNativePG + Barman Cloud plugin | Streaming replicas, automatic failover, continuous WAL archiving and point-in-time restore |
+| Object storage | SeaweedFS | Apache-2.0, S3 API, replication across volume servers. MinIO's community edition no longer ships images |
+| Registry | zot, blobs in SeaweedFS | See [registry.md](/self-hosting/registry) |
+| Metrics | metrics-server, kube-prometheus-stack | HPAs, billing (CPU/memory and Traefik bandwidth), dashboards, alerts |
+| Logs | Loki + Alloy | One Loki process, Alloy tails every pod through the API |

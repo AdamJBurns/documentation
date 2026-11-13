@@ -1,0 +1,121 @@
+---
+title: "Image registry"
+description: "How build images are stored and pulled, and how the registry authenticates."
+---
+Build pods push one image per Ktor module (`<registry>/atoll/<project>/<module>:<deployment id>`) and the nodes
+pull it by digest when an app pod starts. This page describes the registry used for self-hosting and how it is
+secured.
+
+## Why zot
+
+| | zot | Harbor |
+|--|-----|--------|
+| Shape | One Go binary, one volume | ~8 services (core, jobservice, portal, registry, Trivy...) plus its own Postgres and Redis |
+| Footprint | ~100 MB RAM | 2-4 GB RAM |
+| Auth | htpasswd, LDAP, OIDC, API keys, **bearer tokens from an external token server**; per-repository policies | Users, projects, robot accounts with an API |
+| Extras | GC, retention, metrics, OCI artifacts, sync/mirroring | UI, replication, vulnerability scanning, quotas |
+
+The platform needs a private store for its own images, and the platform itself knows which build may push which repository.
+zot keeps that store small and lets the platform become the token issuer (phase 2 below), so per-project access needs
+no second user database. Harbor would work too (a robot account per project, created through its API), but it
+adds a large stateful system and couples the server to Harbor's API.
+
+## Topology
+
+zot runs in the `registry` namespace behind Traefik on `registry.example.com` with a Let's Encrypt
+certificate. It keeps blobs in the SeaweedFS bucket `atoll-registry` (S3 user `registry`, limited to that
+bucket), so images share SeaweedFS' replication and the zot pod itself holds no state. Its NetworkPolicy only
+admits Traefik. Build pods push and nodes pull through that one name (`ATOLL_REGISTRY_PUSH` =
+`ATOLL_REGISTRY_PULL` = `registry.example.com`, `ATOLL_REGISTRY_INSECURE=false`), so there is no plain-HTTP
+path and no node-level mirror to configure. The `atoll-builds` NetworkPolicy allows build pods to reach the
+Traefik pods for that (`networkPolicy.builds.allowIngressController`).
+
+## Phase 1: static users (this install)
+
+`scripts/create-secrets.sh` creates three zot users (`zot-htpasswd`, passwords in `registry/zot-users`):
+
+| User | Rights | Used by | Secret |
+|------|--------|---------|--------|
+| `atoll-push` | read, create, update `atoll/**` | build pods | `atoll-builds/atoll-registry-push` (dockerconfigjson) |
+| `atoll-pull` | read `atoll/**`, `platform/**` | kubelet, for app pods and the builder image | `atoll-apps/atoll-registry-pull`, `atoll-builds/atoll-registry-pull` |
+| `admin` | everything | publishing the platform's own images to `platform/` | — |
+
+Anonymous access is off and nobody can delete except `admin`.
+
+### How the server uses them
+
+The chart exports the Secret names as `ATOLL_REGISTRY_PUSH_SECRET`, `ATOLL_REGISTRY_PULL_SECRET` and
+`ATOLL_BUILDER_PULL_SECRET` (all optional; `ATOLL_REGISTRY_INSECURE` defaults to `false`).
+
+- **Build pods** run the user's Gradle build in the init container `build`, which has no registry
+  credentials, no `DOCKER_CONFIG` and no service account token. It leaves one image layer per Ktor module in an
+  emptyDir. The container `publish` then pushes them: only it mounts the push Secret (key `.dockerconfigjson` as
+  `config.json` at `/var/run/atoll/docker`, `DOCKER_CONFIG` pointing there). It runs as its own uid with a
+  read-only root filesystem, without the project's build env vars, refuses links and special files in the
+  build's outputs, checks every name it reads from them and only hands the layer files to crane as data. The
+  build's processes are gone before it starts. The builder pull Secret goes into the pod's `imagePullSecrets`.
+  A build whose push Secret is missing, not of type `kubernetes.io/dockerconfigjson` or without the
+  `.dockerconfigjson` key fails before its Job is created. The credentials never appear in the Job spec or the
+  build log.
+- **App pods** get the pull Secret as `imagePullSecrets`. Its `auths` key must be the host in
+  `ATOLL_REGISTRY_PULL` (the bundled registry writes both the push and the pull host).
+- **Digests**: `crane append` prints the digest of the image it pushed, `crane mutate` continues from that
+  digest (not the tag) and prints the final digest, which `publish` reports as `repo:<deployment id>@sha256:...`.
+  The server accepts only digest-pinned images under `atoll/<project>/` with the build's deployment id as tag,
+  and the app Deployment references that digest. Promotions roll out the stored reference again, so they run
+  exactly the image that was built. Deployments from before digest pinning must be promoted with `--rebuild`.
+- **Version check**: the server refuses a builder image older than itself ("The builder image is older than
+  this server; set ATOLL_BUILDER_IMAGE ..."). Upgrade the server and `builds.image` together.
+
+**Existing apps:** Deployments created before the pull Secret was set get it on their next rollout only. Until
+then their new pods pull without credentials and fail with `ImagePullBackOff` once anonymous pulls are off.
+Redeploy each Ktor app once, or give the nodes credentials (below) until you have.
+
+**Remaining risk:** every build shares `atoll-push`. The user's build can no longer read it, but anything that
+runs in the `publish` container (the builder image itself) could push to another project's repository.
+Deploying by digest makes such a push harmless for running apps and promotions: an overwritten tag is never
+pulled. Phase 2 removes the shared credential.
+
+Nodes can also pull with node-level credentials instead of the pull Secret:
+`deploy/selfhost/k3s/registries.yaml.example`.
+
+## Phase 2: per-build tokens issued by the platform
+
+zot supports Docker registry token authentication: on a 401 the client fetches a short-lived JWT from a
+"realm" URL and zot checks its signature and the `access` claims for the requested repository.
+
+```
+crane push ──► zot: 401, WWW-Authenticate: Bearer realm="https://atoll.example.com/registry/token",service="atoll-registry"
+crane ──► GET /registry/token?scope=repository:atoll/hello/server:push,pull  (Basic build:<per-build token>)
+Server: build is running, project is "hello", scope is under atoll/hello/  ──► JWT (5 min, push+pull on that repo)
+crane push ──► zot (Bearer JWT) ──► accepted
+kubelet ──► same realm with Basic pull:<pull password> ──► JWT with pull on atoll/*
+```
+
+zot config:
+
+```json
+"auth": { "bearer": { "realm": "https://atoll.example.com/registry/token", "service": "atoll-registry", "cert": "/etc/zot/token.crt" } }
+```
+
+Server changes for phase 2:
+
+| # | Change |
+|---|--------|
+| 1 | Token endpoint (public route, e.g. `GET /registry/token`) implementing the Docker token spec: Basic auth with either a running build's token (scope limited to `repository:atoll/<its project>/*` with `push,pull`) or the pull password (`pull` on `atoll/*`); signs ES256/RS256 JWTs (`iss`, `sub`, `aud`=service, `exp` ≤ 5 min, `access`) |
+| 2 | Settings: `ATOLL_REGISTRY_TOKEN_KEY` (PEM private key, Secret), `ATOLL_REGISTRY_TOKEN_SERVICE` (`atoll-registry`), `ATOLL_REGISTRY_PULL_PASSWORD` (Secret) |
+| 3 | Build Job: drop the shared push secret; `build.sh` passes `build:<token>` to crane (`crane auth login` into a private `DOCKER_CONFIG` before running Gradle, removed afterwards) |
+| 4 | The pull secret holds `pull:<ATOLL_REGISTRY_PULL_PASSWORD>`; nothing changes for nodes |
+
+The per-build token is already random and only valid while that build runs, so a malicious build can only push
+to its own project. On the deploy side `create-secrets.sh` and the zot values change; the chart already has
+everything else.
+
+## Bundled registry (evaluation)
+
+`registry.bundled.enabled` runs a single zot pod inside the chart, over plain HTTP. It always requires a login:
+without `registry.bundled.htpasswdSecret` the chart generates `atoll-push` and `atoll-pull` once (Secret
+`atoll-registry-auth`, kept on uninstall) and writes `atoll-registry-push` (builds namespace) and
+`atoll-registry-pull` (builds and apps namespaces), which it also exports as `ATOLL_REGISTRY_PUSH_SECRET` and
+`_PULL_SECRET`. Both users only reach `atoll/**`. The Service is ClusterIP; only build pods may connect. For node pulls on kind/k3d see
+[install.md](/self-hosting/install#without-the-helmfile).

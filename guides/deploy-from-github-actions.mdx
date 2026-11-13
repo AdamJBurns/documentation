@@ -1,0 +1,87 @@
+---
+title: "Deploy from GitHub Actions"
+description: "Deploy from a GitHub Actions workflow with a personal access token and the atoll CLI."
+---
+The platform can deploy straight from GitHub with its [GitHub App](/deploy/git). If you want tests to pass first, or you already run your builds in GitHub Actions, run `atoll deploy` from a workflow instead. This guide sets that up.
+
+## 1. Create a token
+
+1. In the panel, open **Account** and create a personal access token, for example "GitHub Actions".
+2. Copy the secret. It is shown once.
+
+The token acts as you. You need at least the Developer role in the project's org to deploy. A token never uses the default org from `atoll orgs switch`, so if the first deploy should create the project in a team's org, add `--org <slug>` to the deploy command.
+
+## 2. Store it in GitHub
+
+In your repository on GitHub, open **Settings → Secrets and variables → Actions** and add:
+
+| Name | Value |
+|------|-------|
+| `ATOLL_TOKEN` | the token secret |
+| `ATOLL_SERVER` | your server URL, e.g. `https://atoll.example.com` |
+
+## 3. Add the workflow
+
+`.github/workflows/deploy.yml`:
+
+```yaml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Test
+        run: ./gradlew check
+
+      - name: Install the CLI
+        run: |
+          curl -fsSL -o atoll "$ATOLL_CLI_URL"
+          chmod +x atoll
+        env:
+          ATOLL_CLI_URL: ${{ vars.ATOLL_CLI_URL }}
+
+      - name: Deploy
+        run: ./atoll deploy --name my-app
+        env:
+          ATOLL_SERVER: ${{ secrets.ATOLL_SERVER }}
+          ATOLL_TOKEN: ${{ secrets.ATOLL_TOKEN }}
+```
+
+There is no CLI download yet. Build the Linux x64 binary once (see [Getting started](/getting-started#deploy-your-first-app)), put it where the workflow can fetch it, and set `ATOLL_CLI_URL` as a repository variable with its URL.
+
+## 4. Read the result
+
+`atoll deploy` waits for the deployment and exits with a code GitHub understands:
+
+| Result | Exit code | Job |
+|--------|-----------|-----|
+| `READY` | `0` | passes |
+| `PARTIAL` | `2` | fails |
+| `FAILED` or `CANCELLED` | `1` | fails |
+
+A `PARTIAL` deployment fails the job even though some targets are live. If you would rather pass on `PARTIAL`, allow exit code 2:
+
+```yaml
+      - name: Deploy
+        run: ./atoll deploy --name my-app || [ $? -eq 2 ]
+```
+
+The deploy log is printed in the job output, with secret env var values masked.
+
+## Tips
+
+- Pass `--name` so the project name does not depend on the checkout directory.
+- Use the GitHub App instead if you want a preview per pull request without writing a workflow.
+- Keep the token's expiry short and rotate it. Revoke it in **Account** if it leaks.
