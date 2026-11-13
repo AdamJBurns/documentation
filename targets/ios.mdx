@@ -1,0 +1,47 @@
+---
+title: "iOS apps"
+description: "Build an unsigned iOS simulator app on a macOS build runner."
+---
+Building an iOS app needs macOS. The platform builds it on a macOS build runner: a Mac connected to your org with `atoll-runner`. Today that build is an **unsigned simulator app**. Signed device builds (`.ipa`) are not available yet.
+
+## What you need
+
+- A module that builds an iOS framework (a `link…Framework…Ios…` task, or `embedAndSignAppleFrameworkForXcode`), with a simulator target: `iosSimulatorArm64()`, or `iosX64()` for an Intel simulator build.
+- An Xcode project (`.xcodeproj`) or workspace (`.xcworkspace`) in the source, up to three directories below the Gradle root, e.g. `iosApp/iosApp.xcodeproj` from the Kotlin Multiplatform template. Its build phase runs `./gradlew :<module>:embedAndSignAppleFrameworkForXcode`, as the template does.
+- CocoaPods: the platform does not run `pod install`. A workspace is built when its `Pods` directory is in the source; otherwise the `.xcodeproj` next to it is built.
+- An online macOS [build runner](/self-hosting/runners) for the org, with Xcode installed. The org's own runner always builds; the shared macOS runners only when the org pays as you go.
+- An up-to-date `atoll-runner` on it. Older macOS runners keep building the desktop installers but don't take iOS jobs, and the deployment notes that the runner needs an update.
+
+## What the platform builds
+
+The runner finds the Xcode project and builds its app scheme with `xcodebuild` for the iOS simulator, in the configuration a shared scheme archives with, else Release when the project has one, else the scheme's default, for the architecture of the module's simulator target (`arm64` for `iosSimulatorArm64`, `x86_64` for `iosX64`), with code signing turned off. In a CocoaPods workspace the scheme comes from the app's own Xcode project, not from the Pods schemes. It zips the app and uploads it as `<App>-simulator.app.zip`, for example `iosApp-simulator.app.zip`; characters of the app's name other than letters, digits, space and `. _ + ( ) -` are replaced in the file name.
+
+To try it, unzip the file and drag the `.app` onto a running simulator, or run `xcrun simctl install booted iosApp.app`.
+
+One Xcode build makes one app. When several modules build an iOS framework, the module the Xcode build phase calls gets the app, and the others are skipped with a note that points at it.
+
+The iOS app and the project's macOS desktop installers (`.dmg`, `.pkg`, see [Desktop apps](/targets/desktop)) are built in separate runner jobs, so a failing iOS build does not drop the installers. On shared runners each job's minutes count separately.
+
+## When the iOS target is skipped
+
+`SKIPPED` is not a failure. The rest of the project deploys, and the deployment can still be `READY`. The reason says why:
+
+- No macOS build runner is online for the org (or only shared ones, and the org does not pay as you go).
+- There is no Xcode project in the source.
+- The module has no simulator target.
+- The runner could not build the Xcode project. The platform checks it before it queues a job: several Xcode projects at the same level and none named `iosApp`, a workspace with a `Podfile` but no `Pods` directory and no `.xcodeproj` next to it, or a module called by the Xcode build phase without a simulator target.
+- The runner build failed. The build log has the `xcodebuild` output.
+
+```text
+Deployment 3c9e41a0-5d2b-4f7e-9a61-0b8d2c7e4f15 READY
+
+  WEB  :composeApp  READY    primary  https://my-app-web.atoll.app/
+  IOS  :composeApp  SKIPPED
+      skipped: iOS builds need a macOS build runner, and none is available.
+```
+
+Modules that only declare iOS targets for a library, without a framework, have no iOS target.
+
+## Signing
+
+Code signing is not available yet. You cannot upload certificates or provisioning profiles, and the platform does not build `.ipa` files.

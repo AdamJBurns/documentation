@@ -1,0 +1,77 @@
+---
+title: "Desktop apps"
+description: "The platform packages your Compose Desktop app on every deploy and attaches the result to the deployment."
+---
+## Set up the module
+
+A module is a desktop app when it applies the Compose Multiplatform plugin and has a desktop application:
+
+```kotlin
+plugins {
+    kotlin("multiplatform")
+    kotlin("plugin.compose")
+    id("org.jetbrains.compose")
+}
+
+kotlin {
+    jvm("desktop")
+}
+
+compose.desktop {
+    application {
+        mainClass = "MainKt"
+    }
+}
+```
+
+## What you get
+
+| File | Made by | When |
+|------|---------|------|
+| A runnable JAR, e.g. `composeApp-linux-x64-1.0.0.jar` | `packageUberJarForCurrentOS` | Always |
+| An app archive with its own Java runtime, e.g. `composeApp-linux-x64-1.0.0.tar.gz` | `createDistributable` | When the task exists, which it does for every Compose desktop application |
+| A `.deb` package | `packageDeb` | When `TargetFormat.Deb` is in `nativeDistributions.targetFormats` |
+| A Windows installer, `.msi` and/or `.exe` | `packageMsi`, `packageExe` on a Windows [build runner](/self-hosting/runners) | When `TargetFormat.Msi` or `TargetFormat.Exe` is in `targetFormats`, the server has a Windows runner, and the org pays as you go (its own runner always builds) |
+| A macOS installer, `.dmg` and/or `.pkg` | `packageDmg`, `packagePkg` on a macOS [build runner](/self-hosting/runners) | When `TargetFormat.Dmg` or `TargetFormat.Pkg` is in `targetFormats`, a macOS runner is online for the org, and the org pays as you go (its own runner always builds) |
+
+The JAR, the archive and the `.deb` are built on Linux, so they contain the Linux version of Compose's native parts. Windows installers are built afterwards on a Windows runner, with the same source and build env vars. All files keep the names Gradle gives them; a Windows file whose name another file of the deployment already has gets the module's name in front.
+
+```kotlin
+compose.desktop {
+    application {
+        mainClass = "MainKt"
+        nativeDistributions {
+            targetFormats(TargetFormat.Deb, TargetFormat.Msi, TargetFormat.Exe)
+            packageName = "my-app"
+        }
+    }
+}
+```
+
+The archive, the `.deb` and the Windows installers are extras: if one of them fails to build, the target stays `READY` with the JAR, and a note says what is missing, e.g. "The Windows installers (.msi, .exe) could not be built: No Windows build runner available." Without a Windows runner on the server the note says so. macOS installers (`.dmg`, `.pkg`) work the same way with a macOS runner. They are built in their own runner job, apart from an [iOS app](/targets/ios), so a failing iOS build does not drop them. They are unsigned, so macOS asks before it opens them.
+
+## Getting the build
+
+The files are artifacts of the deployment, in the panel and at the end of `atoll deploy`:
+
+```text
+  DESKTOP  :composeApp  READY
+      composeApp-linux-x64-1.0.0.jar (38.2 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/composeApp-linux-x64-1.0.0.jar
+      composeApp-linux-x64-1.0.0.tar.gz (61.5 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/composeApp-linux-x64-1.0.0.tar.gz
+      my-app_1.0.0-1_amd64.deb (52.0 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/my-app_1.0.0-1_amd64.deb
+      my-app-1.0.0.msi (48.9 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/my-app-1.0.0.msi
+```
+
+Run the JAR with a Java runtime that matches your build's JVM target:
+
+```sh
+java -jar composeApp-linux-x64-1.0.0.jar
+```
+
+The archive needs no Java: unpack it and start the launcher in its `bin` folder.
+
+The platform keeps the files of the last 10 finished deployments per project and environment. Download builds you want to keep longer.
+
+## Not yet supported
+
+The platform does not sign or notarize desktop apps and installers yet.

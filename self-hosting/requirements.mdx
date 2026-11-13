@@ -1,0 +1,81 @@
+---
+title: "Requirements"
+---
+## Nodes
+
+Any x86-64 or arm64 Linux with systemd that k3s supports (Ubuntu 24.04, Debian 13, Rocky/Alma 9). All nodes
+on one L2 network for MetalLB, with fixed IPs.
+
+| Size | Nodes | Per node | Good for |
+|------|-------|----------|----------|
+| Evaluation | 1 | 8 vCPU, 16 GB RAM, 200 GB SSD | Trying it out. No failover |
+| Small production | 3 (all k3s servers) | 8 vCPU, 32 GB RAM, 500 GB NVMe | A few hundred apps, 2-4 parallel builds |
+| Larger | 3 servers + N agents | servers 4 vCPU / 8 GB, agents 16 vCPU / 64 GB | Builds and apps on agents, control plane isolated |
+
+Where the resources go (production defaults):
+
+| Workload | CPU request | Memory request / limit | Disk |
+|----------|-------------|------------------------|------|
+| atoll-server ×2 | 250m each | 768 Mi / 1.5 Gi each | — |
+| Build pod (per running build) | 2 | 6 Gi / 6 Gi | emptyDir, 10-20 GB for Gradle caches |
+| Postgres ×3 (CloudNativePG) | 250m each | 512 Mi / 2 Gi each | 20 Gi data + 10 Gi WAL each |
+| SeaweedFS (3 masters, 3 volumes, 1 filer) | ~0.6 total | ~1.5 Gi total | 200 Gi per volume server |
+| zot | 100m | 256 Mi / 1 Gi | — (blobs in SeaweedFS) |
+| Traefik ×2, cert-manager, CNPG operator, metrics-server | ~0.5 total | ~1 Gi total | — |
+| Prometheus, Grafana, Loki, Alloy (optional) | ~0.5 total | ~2.5 Gi total | 50 Gi + 50 Gi |
+| User apps | 250m each | 256 Mi / 768 Mi each | — |
+
+Builds are the main cost: each one reserves 2 CPUs and 6 GiB until it finishes. `ATOLL_MAX_BUILDS`
+(default 2) limits builds per server replica, so two replicas run up to four at once.
+
+Storage: k3s' local-path provisioner keeps volumes on the node that created them. That is fine because
+Postgres and SeaweedFS replicate across nodes themselves, and the registry stores its images in SeaweedFS.
+Size the SeaweedFS volumes for sources, web apps, artifacts and images together.
+
+## DNS
+
+Point these records at the MetalLB IP of Traefik (`ingress.loadBalancerIP`, or the IP shown by
+`kubectl -n traefik get svc traefik` after install). If the IP is private, forward ports 80 and 443 from your
+public IP to it.
+
+| Record | Type | Purpose |
+|--------|------|---------|
+| `atoll.example.com` | A/AAAA | API (`ATOLL_PUBLIC_URL`) |
+| `app.example.com` | A/AAAA | Panel, if `domains.panel` is set |
+| `*.apps.example.com` | A/AAAA (wildcard) | Ktor apps and web apps |
+| `registry.example.com` | A/AAAA | Image registry; build pods and nodes must resolve it too |
+| `grafana.example.com` | A/AAAA | Grafana (optional) |
+
+**Keep the panel and API off the apps domain.** The panel's session cookie lives on the panel host, and
+everything under `*.apps.example.com` runs user code. If the panel were `panel.apps.example.com`, any user app
+could set or overwrite cookies for it. The chart refuses such a configuration. Best is an apps domain on its
+own registrable domain (e.g. `example-apps.com` next to `atoll.example.com`), so apps are not even same-site
+with the panel.
+
+For the wildcard certificate cert-manager needs API access to the DNS zone of `apps.example.com`: a Cloudflare
+API token with `Zone:DNS:Edit`, or an RFC2136 server (BIND, Knot, PowerDNS) that accepts TSIG-signed updates.
+
+Users' custom domains point a CNAME at `<project>.apps.example.com` (or an A record at the same IP); their
+certificates use HTTP-01, so port 80 must be reachable from the internet.
+
+## Ports
+
+| Port | From | To | Purpose |
+|------|------|----|---------|
+| 80, 443/tcp | internet | MetalLB IP | HTTP(S), ACME HTTP-01 |
+| 6443/tcp | admins, nodes | servers | Kubernetes API |
+| 9345/tcp | nodes | servers | k3s supervisor (joining nodes) |
+| 2379-2380/tcp | servers | servers | embedded etcd |
+| 10250/tcp | nodes | nodes | kubelet (logs, metrics) |
+| 8472/udp | nodes | nodes | flannel VXLAN |
+| 7946/tcp+udp | nodes | nodes | MetalLB memberlist |
+
+Outbound, nodes need HTTPS to container registries (ghcr.io, docker.io, quay.io, registry.k8s.io), Let's
+Encrypt, your DNS provider and Maven/Gradle repositories (builds), and S3 access to the backup bucket.
+
+## Accounts and tools
+
+- An admin machine with `kubectl`, `helm` 4, `helmfile` 1.x, `openssl` and either `htpasswd`
+  (apache2-utils) or Docker.
+- An off-site S3 bucket for Postgres backups (Backblaze B2, Cloudflare R2, Wasabi, Hetzner Object Storage...).
+- The server and builder images, published to a registry the nodes can pull from.

@@ -1,0 +1,412 @@
+---
+title: "CLI reference"
+sidebarTitle: "CLI"
+description: "`atoll` is a single native binary for Linux, macOS and Windows. Run `atoll --help` or `atoll <command> --help` for the same information in your terminal."
+---
+## Global options
+
+| Option | Meaning |
+|--------|---------|
+| `--version` | Print the CLI version and exit. |
+| `-h`, `--help` | Show help for the command. |
+
+Every command that talks to the server also takes:
+
+| Option | Env var | Default |
+|--------|---------|---------|
+| `--server <url>` | `ATOLL_SERVER` | the server you last signed in to, else `http://localhost:8080` |
+| `--token <token>` | `ATOLL_TOKEN` | the token `atoll login` saved for that server |
+
+A server URL without a scheme gets `https://`, except `localhost`, `127.0.0.1` and `[::1]`, which get `http://`.
+
+## Projects and deployment ids
+
+Commands that work on one project take `-p`, `--project <name>`. Without it, `atoll env`, `atoll domains`, `atoll ci`, `atoll firewall` and `atoll rollback` use the name of the current directory, the same way `atoll deploy` does.
+
+Deployment ids can be shortened to their first characters, as `atoll list` shows them. The CLI looks the prefix up among the newest 200 deployments you can see; if more than one matches, it lists them and stops.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success. For `deploy`, `promote` and `rollback`: the deployment is `READY`. |
+| `1` | The deployment `FAILED` or was `CANCELLED`, or the command failed: bad usage, no connection, not allowed, refused by billing. |
+| `2` | The deployment is `PARTIAL`: some targets are live, at least one failed. |
+
+With `--no-wait`, `deploy`, `promote` and `rollback` exit with `0` once the server accepted the request. `atoll domains verify` has its own codes, see below.
+
+## Where the CLI keeps its login
+
+`atoll login` saves one token per server in a file only you can read:
+
+- Linux and macOS: `$XDG_CONFIG_HOME/atoll/config.json`, or `~/.config/atoll/config.json`
+- Windows: `%APPDATA%\atoll\config.json`
+
+The file also remembers the server you signed in to last and your default org per server. `--token` and `ATOLL_TOKEN` always win over the saved token, and they never use the saved default org, so CI is not affected by your local settings.
+
+## atoll deploy
+
+Upload a project and deploy every target in it.
+
+```sh
+atoll deploy [<path>] [--name <project>] [--org <slug>] [--no-wait]
+```
+
+| Argument or option | Meaning |
+|--------------------|---------|
+| `<path>` | Project directory, the root of the Gradle build. Default: the current directory. |
+| `--name <project>` | Project name. Default: the directory name. |
+| `--org <slug>` | Org for a new project. Default: the org picked with `atoll orgs switch`, else your personal org. Ignored, with a warning, when the project already exists. |
+| `--no-wait` | Return right after the upload, with exit code `0`. |
+
+Without `--no-wait`, it prints the log until the deployment finishes, then a summary, and exits with the code for the result. CLI deploys always go to production. Needs the Developer role. See [Deploying with the CLI](/deploy/cli).
+
+## atoll list
+
+List recent deployments, newest first.
+
+```sh
+atoll list [-p <project>] [-e production|preview] [-n <count>] [--before <id>]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `-p`, `--project <name>` | Only this project's deployments. Default: every project you can see. |
+| `-e`, `--environment production\|preview` | Only this environment. |
+| `-n`, `--limit <count>` | How many to show, 1 to 200. Default: 20. |
+| `--before <id>` | Only deployments older than this one. A full page ends with the command for the next one. |
+
+Shows the short id, project, status, environment, age, target counts and live URLs of each deployment.
+
+## atoll logs
+
+Print the build and deploy log of a deployment, or the output of a running Ktor server.
+
+```sh
+atoll logs <id> [-f]
+atoll logs -p <project> [-m <module>] [-d <id>] [-f]
+```
+
+| Argument or option | Meaning |
+|--------------------|---------|
+| `<id>` | Deployment id, or the start of it. Prints its build and deploy log. |
+| `-p`, `--project <name>` | Print the runtime output of the project's running Ktor server instead. |
+| `-m`, `--module <path>` | Ktor module for runtime output, e.g. `:api`. Default: the [primary module](/primary-module). |
+| `-d`, `--deployment <id>` | Read the runtime output of this deployment's preview instead of production. |
+| `-f`, `--follow` | Keep printing new lines. A deployment log stops when the deployment finishes; runtime output runs until you press Ctrl+C. |
+
+Pass either a deployment id or `--project`, not both. Runtime output starts with the last 200 lines, each with the local time and the replica that printed it. Secret values are masked in both kinds of logs. See [Deployments](/deploy/deployments#logs).
+
+## atoll status
+
+Check that the server is reachable and print its version.
+
+```sh
+atoll status
+```
+
+## atoll login
+
+Sign in and save a token for later commands.
+
+```sh
+atoll login [--server <url>] [--token <token>] [--org <slug>]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--server <url>` | Server to sign in to. Default: `ATOLL_SERVER`, else the server you last signed in to, else `http://localhost:8080`. |
+| `--token <token>` | Check and save this token instead of signing in through the browser. |
+| `--org <slug>` | Default org for `deploy` and `projects` on this server. |
+
+Without `--token`, the CLI prints a URL and a code like `BCDF-GHJK`, and opens the panel's device page in your browser. Check that the code matches and approve the sign-in. The code expires after 10 minutes. The CLI then saves the token, and the server becomes the default for later commands.
+
+## atoll logout
+
+Revoke the saved token on the server and forget it.
+
+```sh
+atoll logout [--server <url>]
+```
+
+If the server can't revoke it, the token is still removed from your machine; revoke it in the panel under **Account**.
+
+## atoll whoami
+
+Show the signed-in user, the server, where the token comes from, and your orgs with your role in each.
+
+```sh
+atoll whoami
+```
+
+## atoll orgs
+
+```sh
+atoll orgs ls               # your orgs and roles; the personal and the default org are marked
+atoll orgs switch <slug>    # make an org the default for deploy and projects on this server
+```
+
+## atoll projects
+
+```sh
+atoll projects ls [--org <slug> | --all]
+atoll projects create <name> [--org <slug>]
+atoll projects rm <name> [-y]
+```
+
+| Command | Meaning |
+|---------|---------|
+| `ls` | Projects of the default org, or of every org with `--all` or when no default is set. Shows the latest deployment and the production URL. |
+| `create` | Create an empty project in `--org`, the default org or your personal org. Needs the Developer role. Deploy to it with `atoll deploy --name <name>`. |
+| `rm` | Delete a project with its apps, sites, deployments, env vars, domains and git link. Asks you to type the name unless you pass `-y`, `--yes`. Needs the Admin role. |
+
+## atoll cancel
+
+Stop a deployment that has not finished. It ends as `CANCELLED`; targets that were already live stay live.
+
+```sh
+atoll cancel <id>
+```
+
+Only `QUEUED`, `BUILDING` and `DEPLOYING` deployments can be cancelled. Needs the Developer role.
+
+## atoll promote
+
+Make a finished deployment live again, as a new deployment, with the project's current env vars.
+
+```sh
+atoll promote <id> [--to production|preview] [--rebuild] [--no-wait]
+```
+
+| Argument or option | Meaning |
+|--------------------|---------|
+| `<id>` | The deployment to promote. |
+| `--to production` | Put a preview on production. Without `--to`, the new deployment stays in the environment (and preview) of the old one. A production deployment can't become a preview. |
+| `--rebuild` | Build the kept source again with the current build env vars, instead of reusing the outputs. |
+| `--no-wait` | Return right after the promotion started. |
+
+Waits for the new deployment and exits like `atoll deploy`. Works for the last 10 finished deployments per project and environment. Needs the Developer role. See [Promote and rollback](/deploy/promote-and-rollback).
+
+## atoll rollback
+
+Put the previous good production build back live, without rebuilding it.
+
+```sh
+atoll rollback [-p <project>] [--no-wait]
+```
+
+It promotes the newest `READY` production deployment before the current one that runs a different build. Waits for the new deployment and exits like `atoll deploy`. Needs the Developer role.
+
+## atoll env
+
+List, set and remove a project's env vars and secrets. Changes apply on the next deployment. See [Environment variables](/configure/environment-variables) and the [env vars reference](/reference/env).
+
+Every `atoll env` command takes:
+
+| Option | Meaning |
+|--------|---------|
+| `-p`, `--project <name>` | Project name. Default: the current directory name. |
+| `-e`, `--env production\|preview` | Environment. `set`, `rm` and `import` default to `production`; `ls` lists both unless you pass it. |
+
+### atoll env ls
+
+```sh
+atoll env ls [-p <name>] [-e production|preview]
+```
+
+Lists the variables with their environment, value and what uses them (build, runtime). Secret values show as `(secret)`.
+
+### atoll env set
+
+```sh
+atoll env set KEY=VALUE [-p <name>] [-e production|preview] [--secret] [--no-build] [--no-runtime]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--secret` | Hide the value from the panel, the CLI and logs. It can't be read back. |
+| `--no-build` | Don't pass it to builds. |
+| `--no-runtime` | Don't pass it to running Ktor servers. |
+
+The value is everything after the first `=` and may be empty. Setting an existing key replaces it. Values typed here can end up in your shell history; use `atoll env import` for secrets. Needs the Developer role.
+
+### atoll env import
+
+```sh
+atoll env import FILE [-p <name>] [-e production|preview] [--secret] [--no-build] [--no-runtime]
+```
+
+Sets every variable of a `.env` file of `KEY=value` lines. Existing variables with the same keys are replaced. The flags apply to every imported variable. The file is checked first: with more than 500 variables or a value over 64 KB, nothing is imported. The [env vars reference](/reference/env) describes the file format. Needs the Developer role.
+
+### atoll env rm
+
+```sh
+atoll env rm KEY [-p <name>] [-e production|preview]
+```
+
+Needs the Developer role.
+
+## atoll domains
+
+List, add, verify and remove a project's custom domains. Every `atoll domains` command takes `-p`, `--project <name>`, which defaults to the current directory name. See [Custom domains](/configure/custom-domains).
+
+### atoll domains ls
+
+```sh
+atoll domains ls [-p <name>]
+```
+
+Shows each domain, the target it serves and its status. For each domain that isn't active, it prints the DNS records still needed and the date by which they must exist.
+
+### atoll domains add
+
+```sh
+atoll domains add <domain> [-p <name>] [--web] [--module <path>]
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--web` | Serve the web app. Without it, the domain serves the Ktor server. |
+| `--module <path>` | Serve this Gradle module instead of the primary one, e.g. `:admin`. |
+
+Prints the DNS records to create. Needs the Admin role.
+
+### atoll domains verify
+
+```sh
+atoll domains verify <domain> [-p <name>]
+```
+
+Checks the DNS records now and prints the new status.
+
+| Code | Meaning |
+|------|---------|
+| `0` | The domain is `ACTIVE`. |
+| `2` | It is still being verified or getting its certificate. |
+| `1` | It `FAILED`, or the command failed. |
+
+### atoll domains rm
+
+```sh
+atoll domains rm <domain> [-p <name>] [-y]
+```
+
+The domain stops serving at once. Asks first unless you pass `-y`, `--yes`. Needs the Admin role.
+
+## atoll ci
+
+Turn [CI](/deploy/ci) on and off for a git-linked project, and list, follow, rerun and cancel its runs. CI vars are set with `atoll env set --ci`. Every `atoll ci` command takes `-p`, `--project <name>`.
+
+| Command | What it does |
+|---------|--------------|
+| `atoll ci status` | Shows whether CI is on, and its tasks and branches. |
+| `atoll ci enable [--tasks <tasks>] [--branches <branches> \| --all-branches]` | Turns CI on, or changes its tasks and branches. What you don't pass is kept; the tasks start as `check`. `--branches` limits which pushes run (pull requests always run); `--all-branches` runs pushes to every branch again. Needs the Admin role. |
+| `atoll ci disable` | Turns CI off. Runs already started finish; the tasks and branches are kept. Needs the Admin role. |
+| `atoll ci ls [-n <count>] [-b <branch>]` | Lists runs, newest first. `-n`, `--limit` takes 1 to 200 (default 20). |
+| `atoll ci logs <run> [-f]` | Prints a run's log, with secret values masked. With `-f`, `--follow` it keeps printing until the run finishes, and exits `0` when the run passed and `1` otherwise. |
+| `atoll ci rerun <run>` | Runs the commit of a run again, with the current settings and CI vars. Needs the Developer role. |
+| `atoll ci cancel <run>` | Stops a queued or running run. Needs the Developer role. |
+
+Run ids can be shortened to their first characters, as `atoll ci ls` shows them.
+
+```sh
+atoll ci enable --tasks check,:server:test --branches main,dev
+atoll ci logs 4f2a --follow
+```
+
+## atoll firewall
+
+Edit a project's [firewall](/configure/firewall) from the terminal. `atoll fw` is short for `atoll firewall`. Every command takes `-p`, `--project <name>`, and most commands that print take `--json`.
+
+Changes to rules, IP blocks and managed rulesets go into a draft. `atoll fw publish` makes the draft live within seconds, without a redeploy. Attack mode and lifting a timed block apply at once. Anyone in the project can look at the firewall; changing it needs the Developer role.
+
+### Draft and versions
+
+| Command | What it does |
+|---------|--------------|
+| `atoll fw status` | Shows the published version, unpublished changes, attack mode and the plan's limits. |
+| `atoll fw diff` | Lists what publishing the draft would change. |
+| `atoll fw publish [-m <message>]` | Publishes the draft as a new version. The message shows in `atoll fw versions`. |
+| `atoll fw discard [-y]` | Throws the draft away; the published version stays. Asks first unless you pass `-y`, `--yes`. |
+| `atoll fw versions` | Lists the published versions, newest first. The last 50 are kept. |
+| `atoll fw restore <version> [-m <message>]` | Publishes an older version again, as a new version. The draft is kept. |
+| `atoll fw export [--published \| --draft] [-o <file>]` | Prints the whole config (rules, IP blocks, managed rulesets) as JSON: the draft if there is one, else the published version. |
+| `atoll fw import <file>` | Replaces the draft with a config from `atoll fw export`. Publish it afterwards. |
+
+### Custom rules
+
+Custom rules run in order, before the managed rulesets, and the first terminating action wins. Name a rule by its id, its position or its name.
+
+| Command | What it does |
+|---------|--------------|
+| `atoll fw rules list` | Lists the rules in evaluation order (the draft's, if there is one). `ls` works too. |
+| `atoll fw rules show <rule>` | Shows one rule with all its conditions. |
+| `atoll fw rules add --name <name> --if <condition> --then <action>` | Adds a rule to the draft. |
+| `atoll fw rules edit <rule> [options]` | Changes a rule in the draft. Only what you pass changes: `--if`, `--not` and `--or` replace all conditions, `--then` the action. `--json <file>` replaces the whole rule. |
+| `atoll fw rules remove <rule>` | Removes a rule from the draft. `rm` works too. |
+| `atoll fw rules enable <rule>`, `atoll fw rules disable <rule>` | Switches a rule on or off in the draft. A disabled rule keeps its place. |
+| `atoll fw rules move <rule> <position>` | Moves a rule in the evaluation order. Position `1` is evaluated first. |
+
+A condition is `"<field> <op> <value>"`. Several `--if` conditions must all match; `--or` starts the next group, and the rule matches when any group does. `--not`, or a leading `!`, negates one condition.
+
+| Fields | Operators |
+|--------|-----------|
+| `path`, `host`, `user_agent`, `header:<name>`, `cookie:<name>`, `query:<name>` | `equals`, `starts_with`, `ends_with`, `contains`, `matches`, `in`, `exists` |
+| `method`, `environment`, `protocol`, `ip`, `country`, `continent`, `asn` | `equals`, `in` |
+
+`in`, `starts_with`, `ends_with` and `contains` take comma-separated values.
+
+| Action | Options |
+|--------|---------|
+| `--then deny`, `log`, `challenge` or `bypass` | |
+| `--then redirect:<path or URL>[:permanent]` | |
+| `--then rate-limit` | `--limit` requests per window (default 100), `--window` such as `60s` or `10m` (default `60s`), `--key` `ip`, `user_agent` or `header:<name>`, repeatable (default `ip`), `--algorithm fixed-window` (default) or `token-bucket`, `--then-limit` what happens over the limit: `too-many-requests` (default), `deny`, `challenge` or `log` |
+
+`--persist <duration>`, from `1m` to `24h`, blocks the client IP that long after a deny, challenge or rate limit. With `atoll fw rules edit`, `--persist off` removes it.
+
+```sh
+atoll fw rules add --name "Rate limit login" --if "path equals /login" --if "method equals POST" \
+  --then rate-limit --limit 10 --window 1m
+atoll fw publish -m "Rate limit login"
+```
+
+### IP blocking
+
+| Command | What it does |
+|---------|--------------|
+| `atoll fw ip list` | Lists blocked IPs and CIDRs (the draft's, if there is one). |
+| `atoll fw ip block <ip> [--host <host>] [--note <text>]` | Blocks an IP or CIDR, v4 or v6, in the draft. Every host of the project unless you pass `--host`. |
+| `atoll fw ip unblock <ip> [--host <host>]` | Removes an IP or CIDR, or a block by its id, from the draft. |
+| `atoll fw blocks list` | Lists the IPs a rule with `--persist` blocked for a time, and when each block ends. |
+| `atoll fw blocks remove <ip>` | Lifts such a block at once. |
+
+### Managed rulesets
+
+`atoll fw managed list` shows the rulesets. `atoll fw managed set <ruleset> <mode>` sets one in the draft:
+
+| Ruleset | Modes |
+|---------|-------|
+| `bot-protection` | `off`, `log`, `challenge` |
+| `ai-crawlers`, `ai-assistants` | `allow`, `log`, `deny` |
+| `owasp` | `on`, `off` |
+
+The OWASP core rules take more options: `--paranoia` 1 to 4, `--threshold` (the anomaly score that blocks; 5 by default), `--group <group>=off|log|deny` for one rule group, `--inspect-bodies` or `--no-inspect-bodies`, and `--max-body` such as `1MB` (larger requests are refused).
+
+```sh
+atoll fw managed set ai-crawlers deny
+atoll fw managed set owasp on --paranoia 2 --group php=off
+```
+
+### Attack mode and traffic
+
+```sh
+atoll fw attack-mode on|off [--for <duration>]
+```
+
+Challenges every visitor while you are under attack. Verified good bots (Googlebot, Bingbot and the like), in-cluster traffic and visitors who solved the challenge pass. It applies at once, without publishing. `--for` turns it off again after a time, such as `1h`, `6h` or `24h`.
+
+```sh
+atoll fw traffic [--range 10m|1h|24h] [--by <field>] [--action <action>] [--rule <id>] [-n <count>]
+```
+
+Shows requests per firewall action. `--by` lists the top values of `ip`, `path`, `host`, `country`, `asn`, `user-agent` or `rule`; `-n`, `--limit` sets how many (1 to 100). `--action` keeps one of `allowed`, `logged`, `challenged`, `denied`, `rate-limited` or `redirected`, and `--rule` the requests one rule decided.

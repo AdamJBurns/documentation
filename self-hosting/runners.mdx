@@ -1,0 +1,250 @@
+---
+title: "Build runners"
+description: "The platform builds on Linux. Some files can only be built on another OS: Windows installers (`.msi`, `.exe`) need Windows, macOS installers need macOS. A build runner is a Windows or macOS host that builds them for the server."
+---
+```text
+atoll deploy ──> server ──> Linux build (JAR, .deb, web, Android, Ktor)
+                    │            │ model: ":desktop needs windows: packageMsi, packageExe"
+                    │            v
+                    └──> runner jobs (one per OS) <── atoll-runner agent polls over HTTPS
+                                 │
+                                 v
+                          atoll-runner build (in a fresh VM): Gradle, then uploads the .msi/.exe
+```
+
+1. The Linux build runs as always. When the server has an online Windows runner, it passes `-Patoll.runners=windows`
+   to Gradle, and the platform's init script turns the configured Windows formats (`TargetFormat.Msi`, `TargetFormat.Exe`)
+   into work for a runner instead of a note.
+2. After the Linux build, the server queues one job per OS, and on macOS a separate one for the [iOS app](/targets/ios),
+   so a failing iOS build does not drop the `.dmg`/`.pkg`. A runner claims a job, builds the same source with the same
+   build env vars, and uploads the files. They join the target's files on the deployment. On shared runners each job's
+   minutes count separately.
+3. If no runner picks the job up within 15 minutes, the job runs longer than 60 minutes, fails, or the org is on the
+   free plan without a runner of its own, the target is still deployed with what Linux built and a note says what is
+   missing.
+
+## Shared runners and your own
+
+| | Shared runners | Self-hosted runners |
+|---|---|---|
+| Who runs them | the platform, on its own Macs and Windows machines | an org, on its own hardware |
+| Added by | platform admins | the org's admins (panel: **Runners**) |
+| Build for | every org (**shared**, VM per job), or one org (**dedicated**) | their org only |
+| Billed | runner minutes per OS (`BUILD_MINUTES_WINDOWS`, `BUILD_MINUTES_MACOS`, see [Billing settings](/self-hosting/billing-settings)) | no |
+| Free plan | no | yes |
+
+An org's jobs go to its **own** runners first:
+
+- A job of an org with an own runner of that OS online waits for one of them. Shared runners leave it alone for
+  `ATOLL_RUNNERS_SHARED_FALLBACK_SECONDS` (2 minutes), then the first free runner takes it.
+- Without an own runner online (or all of them draining) shared runners take the job at once.
+- When billing refuses shared runners (free plan, spend limit) but the org has an own runner of that OS online, the job
+  is queued for its own runners only, and the log says so. Without one the target gets a note instead.
+- Minutes of jobs an org's own runner ran are not recorded.
+
+Members see their org's runners (status, OS, version, last seen, the job it runs or ran last) and, as counts only, how
+many shared runners per OS are online and free. Org admins add, rotate, drain and remove their own runners.
+
+## The two parts of `atoll-runner`
+
+| Command | Runs | Holds |
+|---------|------|-------|
+| `atoll-runner agent` | on the host, as a service | the runner token. It polls for jobs, sends heartbeats, ships logs and stops builds the server cancels. It never runs project code itself. |
+| `atoll-runner build` | in the executor, one per job | only a job token, valid for one attempt of one job, that may download that job's source and upload installer files of that job's targets. |
+
+The agent starts each build through an **executor**:
+
+| Executor | Isolation | Status |
+|----------|-----------|--------|
+| `hyperv` (Windows default) | a fresh Hyper-V VM per job, destroyed afterwards | not implemented yet |
+| `tart` (macOS default) | a fresh macOS VM per job with [Tart](https://tart.run) | not implemented yet |
+| `direct` | **none** | works; for development and testing only |
+
+<Warning>
+  The `direct` executor runs `atoll-runner build`, and with it the project's Gradle build, as the agent's OS user on the host. Project code can read everything that user can, including the runner token file, and can leave files behind. Only use it with projects you trust, on a host that holds nothing else.
+</Warning>
+
+Because of that, a runner reports whether its builds are isolated, and the server limits what a non-isolated one
+gets:
+
+- A **non-isolated** runner (`--executor direct`) must be registered with a token **pinned to one org** and only ever
+  gets that org's jobs. A stolen runner token then reaches no other org's source or env vars.
+- A runner **not pinned** to an org serves every org and must be isolated. If its agent ever polls without
+  isolation, it gets no jobs.
+
+What `direct` still does to contain a build: the build gets a minimal environment (`PATH`, `JAVA_HOME`, temp and
+profile directories, the job token; nothing of the agent's own settings or its token file path), runs in a fresh
+directory under `atoll-runner-jobs` that only the agent's user can open, and everything it started is killed when it
+ends (a Windows job object; on macOS and Linux its process group). The agent takes no new job while processes of the
+previous build are still alive. If you can, run the agent as a dedicated OS user whose home holds nothing else;
+running builds as yet another user is not supported yet.
+
+Until the VM executors exist, the agent refuses to start unless you pass `--executor direct`.
+
+## Requirements
+
+- A JDK 17 or newer on `PATH` or in `JAVA_HOME` (the project's Gradle wrapper picks its own Gradle).
+- Windows: Windows 10 or Server 2019 or newer (for `tar.exe`). Compose downloads WiX 3 itself for `.msi` and `.exe`.
+- macOS: Apple silicon with Xcode and its command line tools, for `.dmg`, `.pkg` and unsigned iOS simulator apps (see [iOS apps](/targets/ios)).
+  iOS apps need an up-to-date `atoll-runner`: older macOS runners keep building installers but don't take iOS jobs,
+  and the deployment notes that the runner needs an update.
+- Outbound HTTPS to the server's public URL. Runners need no inbound ports.
+
+## Register a runner
+
+Everything starts with a one-time registration token, valid for 24 hours by default.
+
+**Your org's runner.** In the panel open **Runners** and click **Add runner** (org admins): it shows the token and the
+commands for macOS and Windows. Or with the API:
+
+```sh
+curl -X POST -H "Authorization: Bearer $ATOLL_TOKEN" https://atoll.example.com/api/orgs/acme/runners/registrations
+# {"token":"atreg_...","expiresAt":...,"org":"<org id>","server":"https://atoll.example.com","selfHosted":true}
+```
+
+The runner is pinned to the org, so it may use `--executor direct`.
+
+**A shared runner.** A platform admin (a verified email in `ATOLL_AUTH_ADMIN_EMAILS`, or the `ATOLL_TOKEN` holder on a
+server without accounts) creates the token. For a `direct` runner, dedicate it to the org (by slug) whose deployments
+it builds:
+
+```sh
+curl -X POST -H "Authorization: Bearer $ATOLL_TOKEN" -H "Content-Type: application/json" \
+  -d '{"ttlHours": 24, "org": "acme"}' https://atoll.example.com/api/runners/registrations
+# {"token":"atreg_...","expiresAt":...,"org":"<org id>","server":"https://atoll.example.com"}
+```
+
+Without `"org"` the token only registers isolated runners, shared by every org. On a server without accounts the
+panel's **Runners** page creates tokens for org `local`, which every project is in; runners are kept in memory there,
+so register them again after a restart.
+
+On the runner host, as the account the agent will run as:
+
+```sh
+atoll-runner register --server https://atoll.example.com --registration-token atreg_... --executor direct --labels os=windows,arch=x64
+```
+
+This saves the runner token to `%ProgramData%\atoll-runner\runner.json` on Windows or
+`~/.config/atoll-runner/runner.json` elsewhere (change it with `--token-file`), readable by that account only. The
+registration token is used up.
+
+**Labels** are `key=value` pairs. `os` is required (`windows` or `macos`); jobs need `os=<their OS>` and go to the
+oldest waiting job's first free matching runner. `--labels` defaults to the host's `os` and `arch`.
+
+## Run the agent
+
+```sh
+atoll-runner agent --executor direct
+```
+
+An agent runs one job at a time; run several hosts for more. It reconnects with backoff when the server is
+unreachable. A job whose agent stops sending heartbeats for a minute goes back to the queue once; a second loss fails it.
+When a deployment is cancelled, the agent stops the build at its next heartbeat (every 10 seconds).
+
+### As a Windows service
+
+Use a dedicated local user for the service, register as that user, and point the service at its token file. With
+[NSSM](https://nssm.cc):
+
+```powershell
+nssm install atoll-runner "C:\Program Files\atoll-runner\atoll-runner.exe" agent --executor direct --token-file C:\ProgramData\atoll-runner\runner.json
+nssm set atoll-runner ObjectName .\atoll-runner <password>
+nssm start atoll-runner
+```
+
+### As a launchd daemon (macOS)
+
+`/Library/LaunchDaemons/app.atoll.runner.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>app.atoll.runner</string>
+  <key>UserName</key><string>atoll-runner</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/atoll-runner</string>
+    <string>agent</string>
+    <string>--token-file</string>
+    <string>/Users/atoll-runner/.config/atoll-runner/runner.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/atoll-runner.log</string>
+  <key>StandardErrorPath</key><string>/var/log/atoll-runner.log</string>
+</dict>
+</plist>
+```
+
+Load it with `sudo launchctl bootstrap system /Library/LaunchDaemons/app.atoll.runner.plist`. (Until the Tart executor
+exists, add `--executor direct` and read the warning above.)
+
+## Rotate and revoke
+
+```sh
+atoll-runner rotate        # new token in the token file; the old one keeps working for 24 hours
+```
+
+The agent reads the token file before every poll, so a running agent picks up the new token. Only the current token
+can rotate, and a second rotation ends the previous token's grace at once. A rotation with the previous token means a
+copy of it is out there: the server revokes the runner, marks it `compromised` and stops its build; register the host
+again with a new registration token.
+
+**Rotate from the panel** (or `POST .../rotate`) when the host is out of reach or the token may have leaked: the
+runner's token stops working at once, a build it runs goes back to the queue, and you get a one-time registration
+token. Running `atoll-runner register` with it on the host (the panel shows the command, with the runner's name and
+labels) gives the same runner a new token; it keeps its id, org and history. Only the newest rotation token works.
+Restart the agent afterwards; a service restarts it by itself.
+
+**Drain** a runner before maintenance: it finishes its job and takes no new ones until you resume it.
+
+**Remove** a runner to take it out for good; its running job goes back to the queue. Removed runners can't come back,
+register the host again instead.
+
+| | Platform admins (any runner) | Org admins (their org's own) |
+|---|---|---|
+| List | `GET /api/runners` | `GET /api/orgs/{org}/runners` (members too; with shared runner counts) |
+| New token | `POST /api/runners/registrations` | `POST /api/orgs/{org}/runners/registrations` |
+| Rotate | `POST /api/runners/{id}/rotate` | `POST /api/orgs/{org}/runners/{id}/rotate` |
+| Drain | `POST /api/runners/{id}/drain` with `{"draining": true}` (`false` resumes) | `POST /api/orgs/{org}/runners/{id}/drain` |
+| Remove | `DELETE /api/runners/{id}` | `DELETE /api/orgs/{org}/runners/{id}` |
+
+```sh
+curl -H "Authorization: Bearer $ATOLL_TOKEN" https://atoll.example.com/api/runners            # list
+curl -X DELETE -H "Authorization: Bearer $ATOLL_TOKEN" https://atoll.example.com/api/runners/rn_...
+```
+
+## Server settings
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_RUNNERS_SEAL_KEY` | unset; required with a database | base64 AES-256 key (`openssl rand -base64 32`) that encrypts a job's build env vars while it waits and runs; they are deleted when the job ends. Set the same key on every replica |
+| `ATOLL_RUNNERS_QUEUE_TIMEOUT_MINUTES` | `15` | how long a job may wait for a runner |
+| `ATOLL_RUNNERS_JOB_TIMEOUT_MINUTES` | `60` | how long a job may run |
+| `ATOLL_RUNNERS_SHARED_FALLBACK_SECONDS` | `120` | how long a job of an org with its own runner of that OS online waits for one of them before shared runners may take it; `0` lets them take it at once |
+
+Runners call the public `/api/runners/...` paths with bearer tokens, never with a session, so the server's public URL
+is all they need. Tokens are stored as SHA-256 hashes.
+
+## Protocol
+
+For people writing executors. All calls send `X-Atoll-Runner-Protocol: 1`.
+
+| Call | Token | Purpose |
+|------|-------|---------|
+| `POST /api/runners/agent/register` | registration token in the body | with `isolated`; answers the runner id and token |
+| `POST /api/runners/agent/poll` | runner | with `isolated`; waits up to 30 s; answers a job (id, job token, timeouts) or 204 |
+| `POST /api/runners/agent/rotate` | runner | answers a new runner token |
+| `POST /api/runners/jobs/{id}/heartbeat` | runner | keeps the lease; `{"cancel": true}` (cancelled, or the job ended) means stop the build now |
+| `POST /api/runners/jobs/{id}/logs` | runner | `{"lines": [...]}`, at most 2 MB, shown in the deployment log as `[windows] ...`; accepted until `finish`, at most 30 s after the build's result |
+| `POST /api/runners/jobs/{id}/finish` | runner | after the build process exited and its output was sent; fails the job if the build reported nothing |
+| `GET /api/runners/jobs/{id}/spec` | job | targets, Gradle tasks, init script, build env vars |
+| `GET /api/runners/jobs/{id}/build/source` | job | the source `.tar.gz` |
+| `PUT /api/runners/jobs/{id}/build/artifacts?module=&kind=&name=` | job | one installer file (`.msi`, `.exe`; on macOS `.dmg`, `.pkg`, `.ipa`, `.app.zip`) |
+| `POST /api/runners/jobs/{id}/build/complete` | job | `{"success": true}` or `{"success": false, "error": "..."}` |
+
+The executor starts `atoll-runner build --server <url> --job <id>` with the job token in `ATOLL_JOB_TOKEN`, in an
+empty directory. A VM executor would copy the `atoll-runner` binary into a fresh VM, run that command there, stream
+its output back to the agent and destroy the VM afterwards.

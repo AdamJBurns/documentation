@@ -1,0 +1,103 @@
+---
+title: "Deploying with the CLI"
+description: "`atoll deploy` uploads your project and deploys every target in it. It is the same command on your laptop and in CI."
+---
+## Deploy
+
+Run it in the root of your Gradle build:
+
+```sh
+atoll deploy
+```
+
+Or pass the path:
+
+```sh
+atoll deploy ./my-app
+```
+
+What happens:
+
+1. The CLI packages the source. Inside a git repository it takes the files git knows about; see [What gets uploaded](/project-structure#what-gets-uploaded).
+2. It uploads the archive to the project. If the project does not exist yet, the platform creates it: in the org you pass with `--org`, else in your default org (`atoll orgs switch`), else in your personal org.
+3. It prints the build and deploy log as it runs.
+4. When the deployment finishes, it prints a summary and exits with a code that matches the result.
+
+CLI deploys always go to production. Pull requests from a [linked repository](/deploy/git) get [previews](/deploy/previews).
+
+## The project name
+
+The project is named after the directory, lowercased, with other characters turned into `-`. Pass `--name` to choose it yourself:
+
+```sh
+atoll deploy --name my-app
+```
+
+See [Project names](/project-structure#project-names) for the rules.
+
+## The summary
+
+```text
+Deployment 3c9e41a0-5d2b-4f7e-9a61-0b8d2c7e4f15 PARTIAL
+  1 of 3 targets failed: :admin (KTOR): Process exited with code 1
+
+  KTOR     :api         READY   primary  https://my-app.atoll.app/
+  KTOR     :admin       FAILED
+      error: Process exited with code 1
+  ANDROID  :androidApp  READY
+      note: Debug build: for a signed release APK and App Bundle, set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD in the project's build env vars.
+      androidApp-debug.apk (6.1 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/androidApp-debug.apk
+
+The READY targets are live. Fix the failed targets and deploy again.
+```
+
+Each line shows the target kind, the Gradle module, its status, whether it is the [primary](/primary-module) one, and its URL once it is live. Under it come notes, the reason a target was skipped, the error of a failed one, and the files of Android and desktop targets.
+
+## Exit codes
+
+| Result | Exit code |
+|--------|-----------|
+| `READY` | `0` |
+| `PARTIAL` | `2` |
+| `FAILED` or `CANCELLED` | `1` |
+| Usage or connection error, or the upload was refused | `1` |
+
+Use them to gate a CI job: `PARTIAL` means something is live but not everything.
+
+## Don't wait
+
+`--no-wait` returns as soon as the upload is accepted, with exit code `0`. Follow the deployment later:
+
+```sh
+atoll deploy --no-wait
+atoll logs 3c9e41a0 --follow
+```
+
+## Deploying from CI
+
+In CI, use a personal access token instead of `atoll login`:
+
+1. In the panel, open **Account** and create a token. Copy the secret; it is shown once.
+2. Store it as a secret in your CI system.
+3. Pass it to the CLI as `ATOLL_TOKEN`, with the server in `ATOLL_SERVER`:
+
+```sh
+ATOLL_SERVER=https://atoll.example.com ATOLL_TOKEN=$ATOLL_TOKEN atoll deploy --name my-app
+```
+
+The token acts as you, with your roles. A token never uses the default org saved by `atoll orgs switch`, so pass `--org` if the first deploy must create the project in a team's org. The [GitHub Actions guide](/guides/deploy-from-github-actions) has a full workflow.
+
+## Server and token options
+
+Every command that talks to the server takes:
+
+| Option | Env var | Default |
+|--------|---------|---------|
+| `--server <url>` | `ATOLL_SERVER` | the server you last signed in to, else `http://localhost:8080` |
+| `--token <token>` | `ATOLL_TOKEN` | the token `atoll login` saved for that server |
+
+## Limits
+
+- The upload can be at most 500 MB. Keep build outputs and large binary files out of the source, or add them to `.gitignore`.
+- When every build slot of the server is busy, a deployment waits in `QUEUED` until one is free.
+- If your org has used up a free amount or reached its spend limit, the upload is refused with a message that says why and links to the org's **Billing** tab. See [Billing](/teams/billing).

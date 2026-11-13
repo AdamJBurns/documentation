@@ -1,0 +1,55 @@
+---
+title: "Billing settings"
+description: "The platform always meters usage. Billing (plans, limits, Stripe) is on only when a Stripe secret key is set; without it every deployment is admitted, apps are never stopped, and the billing API answers 404."
+---
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_BILLING_STRIPE_SECRET_KEY` | unset | Stripe secret key (`sk_live_...` or `sk_test_...`). Turns billing on. |
+| `ATOLL_BILLING_STRIPE_WEBHOOK_SECRET` | unset | Signing secret of the webhook endpoint (`whsec_...`). Required with the key. |
+| `ATOLL_BILLING_STRIPE_API_URL` | `https://api.stripe.com` | Only for proxies or a Stripe mock. |
+| `ATOLL_BILLING_PAYMENT_GRACE_DAYS` | `7` | Days a failed invoice may stay unpaid before new deployments are refused. |
+| `ATOLL_BILLING_PROMETHEUS_URL` | unset | Prometheus that scrapes the ingress controller; used for Ktor app bandwidth. Unset: not counted. |
+| `ATOLL_BILLING_INGRESS` | `traefik` | Which controller's metrics to read: `traefik` (`traefik_service_responses_bytes_total`) or `nginx` (`nginx_ingress_controller_response_size_sum`). |
+| `ATOLL_BILLING_FREE_<METRIC>` | per metric | Free allowance per org per calendar month (UTC), in the metric's unit. `0` means no free usage. `<METRIC>` is `BUILD_MINUTES`, `CPU_HOURS`, `MEMORY_GB_HOURS`, `BANDWIDTH_GB`, `STORAGE_GB_MONTHS`, `BUILD_MINUTES_WINDOWS` or `BUILD_MINUTES_MACOS`. |
+| `ATOLL_BILLING_PRICE_<METRIC>` | per metric | Price in US dollars per unit past the allowance, e.g. `0.04`. |
+
+`<METRIC>` is one of:
+
+| Metric | Unit | Free | Price |
+|--------|------|------|-------|
+| `BUILD_MINUTES` | minute | 300 | $0.01 |
+| `CPU_HOURS` | vCPU-hour | 100 | $0.04 |
+| `MEMORY_GB_HOURS` | GiB-hour | 200 | $0.005 |
+| `BANDWIDTH_GB` | GB (10^9 bytes) | 100 | $0.08 |
+| `STORAGE_GB_MONTHS` | GB-month (1 GB kept 730 hours) | 5 | $0.10 |
+| `BUILD_MINUTES_WINDOWS` | minute on a Windows [build runner](/self-hosting/runners) | 0 | $0.02 |
+| `BUILD_MINUTES_MACOS` | minute on a macOS [build runner](/self-hosting/runners) | 0 | $0.10 |
+
+Runner minutes run from the moment a runner claims a job to the moment the job ends, both as the server sees them.
+On the free plan runner builds are skipped (the target gets a note), whatever `ATOLL_BILLING_FREE_BUILD_MINUTES_*` says.
+Subscriptions created before a metric existed get its price added (without proration) at server start and with the
+next hourly report, so runner minutes are billed on them too. Metrics are matched by Stripe meter, so a changed price
+never bills a metric twice.
+
+## Stripe setup
+
+1. Add a webhook endpoint pointing at `https://<server>/api/webhooks/stripe` with these events:
+   `checkout.session.completed`, `payment_method.attached`, `payment_method.detached`, `invoice.paid`,
+   `invoice.payment_failed`, `invoice.voided`, `invoice.marked_uncollectible`, `customer.subscription.deleted`.
+2. Enable the customer portal in the Stripe dashboard (Settings, Billing, Customer portal).
+3. Set the two variables above. Meters (`atoll_<metric>`) and monthly metered prices are created in Stripe on first
+   use. Changing a price creates a new Stripe price that new subscriptions use; existing ones keep theirs.
+
+Set `ATOLL_PANEL_URL`: Checkout and the portal send users back to `<panel>/#/orgs/<org>/billing`.
+
+## Behaviour
+
+- **Free plan**: once any allowance is used up, new deployments are refused. Once CPU, memory or bandwidth is used up,
+  the org's running apps are stopped until the next month or until a card is added.
+- **Pay as you go**: starts when a card is added. Usage past the allowance is reported to Stripe hourly and invoiced
+  monthly. An optional spend limit refuses new deployments and stops running apps once the month's cost reaches it.
+- Usage reports run at 7 minutes past every hour. The month's last hour is reported shortly after midnight UTC on the
+  1st, before Stripe finalizes the invoice (about an hour later). Usage that turns up after that is billed on the
+  next month's invoice.
+- If Stripe cancels a subscription after failed payments, the org drops to the free plan; adding a card, or
+  "Switch to pay as you go" in the panel, starts a new subscription.

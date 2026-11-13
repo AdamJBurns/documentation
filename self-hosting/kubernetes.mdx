@@ -1,0 +1,509 @@
+---
+title: "Running the platform on Kubernetes"
+sidebarTitle: "Development cluster (kind)"
+description: "With `ATOLL_RUNTIME=kubernetes` the server builds and runs projects on a cluster instead of its own host:"
+---
+- every deployment is built by a **Job** in `atoll-builds`, running the builder image;
+- every Ktor module becomes a **Deployment + Service + Ingress + HPA** in `atoll-apps`, with its env vars in a **Secret**;
+- uploaded sources, web apps and downloadable artifacts are kept in **object storage** (S3-compatible);
+- deployment records, accounts, logs and build callbacks are kept in **Postgres**.
+
+The server keeps no state of its own, so it runs as several replicas behind one Service and survives restarts.
+
+There is one set of manifests: the Helm chart in `deploy/helm/atoll`.
+
+- **Production**: follow the [self-hosting guide](/self-hosting/overview). It installs the chart with a helmfile, next to
+  Traefik, cert-manager, a replicated Postgres (CloudNativePG), SeaweedFS, zot and monitoring.
+- **Development**: this page. `deploy/k8s` renders the same chart through kustomize with `deploy/k8s/values.yaml`:
+  bundled single-pod Postgres, SeaweedFS and zot, and ingress-nginx on a local [kind](https://kind.sigs.k8s.io/)
+  cluster. ingress-nginx no longer gets fixes since March 2026, so never expose a cluster set up this way.
+
+```
+                     ingress controller
+         ┌───────────────┴───────────────────────┐
+ atoll.localhost, *.apps.atoll.localhost    hello.apps.atoll.localhost
+         │ :8080 (API, panel, web apps)          │
+ ┌───────▼──────────── atoll ──────────┐   ┌──── atoll-apps ─────────────┐
+ │ atoll-server ×N   atoll-registry    │   │ Deployment hello--server    │
+ │ atoll-postgres    atoll-storage     │   │ Secret hello--server-env    │
+ └───────▲───────────────▲─────────────┘   └──────────▲──────────────────┘
+         │ :8081         │ image push                 │ image pull (node)
+         │ build protocol│                            │
+ ┌───────┴── atoll-builds┴─────────────┐              │
+ │ Job atoll-build-<id>                │──────────────┘
+ └─────────────────────────────────────┘
+```
+
+## Development cluster with kind
+
+### Prerequisites
+
+- Docker with at least 8 GB of memory, a recent [kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installation),
+  `kubectl` and `helm` (kustomize calls it to render the chart).
+- Builds request 2 CPUs and 6 GiB by default. On a small machine lower `builds.cpu` and `builds.memory` in
+  `deploy/k8s/values.yaml`.
+
+### 1. Create the cluster
+
+The cluster needs ports 80/443 for the ingress controller and a containerd registry config directory, so nodes
+can pull the images the platform builds:
+
+```sh
+cat <<EOF | kind create cluster --name atoll --config=-
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+nodes:
+  - role: control-plane
+    labels:
+      ingress-ready: "true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+      - containerPort: 443
+        hostPort: 443
+EOF
+```
+
+### 2. Let nodes pull from the bundled registry
+
+Build pods push app images to the bundled zot registry by its cluster DNS name,
+`atoll-registry.atoll.svc.cluster.local:5000`. The container runtime on the nodes does not use cluster DNS, so
+every node gets a containerd mirror for that name pointing at the registry's NodePort (`30500`):
+
+```sh
+for node in $(kind get nodes --name atoll); do
+  dir=/etc/containerd/certs.d/atoll-registry.atoll.svc.cluster.local:5000
+  docker exec "$node" mkdir -p "$dir"
+  printf '[host."http://localhost:30500"]\n  capabilities = ["pull", "resolve"]\n' |
+    docker exec -i "$node" sh -c "cat > $dir/hosts.toml"
+done
+```
+
+Containerd reads `hosts.toml` on every pull, no restart is needed. Node pulls arrive at the registry from the node's
+pod network gateway; `registry.bundled.nodeAccess.allowedCIDRs` in `deploy/k8s/values.yaml` admits kindnet's
+default (`10.244.0.1/32`). The chart generates the registry users and the push and pull Secrets itself.
+
+### 3. Ingress controller and metrics-server
+
+```sh
+kubectl apply -f https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml
+kubectl wait -n ingress-nginx --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=180s
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+```
+
+HPAs need metrics-server; kind does not ship it.
+
+### 4. Build and load the images
+
+From the repository root:
+
+```sh
+docker build -f deploy/server/Dockerfile -t atoll/server:local .
+docker build -f deploy/builder/Dockerfile -t atoll/builder:local .
+kind load docker-image atoll/server:local atoll/builder:local --name atoll
+```
+
+`kind load` puts the images straight into the node's containerd. The tag is `local`, not `latest`, because
+Kubernetes always pulls `latest` and these images exist nowhere else. The builder image is large (JDK and Android
+SDK); loading it takes a while.
+
+### 5. Secrets and the platform
+
+```sh
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl -n atoll create secret generic atoll-env --from-literal=ATOLL_ENV_KEYS="k1:$(openssl rand -base64 32)" \
+  --from-literal=ATOLL_RUNNERS_SEAL_KEY="$(openssl rand -base64 32)"
+kubectl -n atoll create secret generic atoll-postgres --from-literal=password="$(openssl rand -hex 24)"
+S3_SECRET=$(openssl rand -hex 24)
+kubectl -n atoll create secret generic atoll-storage \
+  --from-literal=access-key=atoll --from-literal=secret-key="$S3_SECRET" \
+  --from-literal=s3.json="{\"identities\":[{\"name\":\"atoll\",\"credentials\":[{\"accessKey\":\"atoll\",\"secretKey\":\"$S3_SECRET\"}],\"actions\":[\"Admin\",\"Read\",\"List\",\"Write\"]}]}"
+
+kubectl kustomize --enable-helm --load-restrictor LoadRestrictionsNone deploy/k8s | kubectl apply -f -
+kubectl -n atoll rollout status deployment/atoll-server --timeout=5m
+curl http://atoll.localhost/api/health
+```
+
+`ATOLL_ENV_KEYS` encrypts project env vars; keep it, or stored values become unreadable. `ATOLL_RUNNERS_SEAL_KEY`
+encrypts the env vars of waiting [build runner](/self-hosting/runners) jobs; changing it only fails the jobs queued at that moment. `s3.json` is SeaweedFS'
+list of S3 users and must hold the same keys as `access-key` and `secret-key`. The load restrictor is needed
+because the chart lives outside `deploy/k8s`. Add your own kustomize overlays on top of `deploy/k8s` as usual;
+every chart value is documented in `deploy/helm/atoll/values.yaml`.
+
+### 6. Sign in and deploy
+
+The server has a database, so accounts are on. Open `http://atoll.localhost`, sign up, and open the verification
+link from the server log (no SMTP server is configured, and the panel is on http, so the link is logged):
+
+```sh
+kubectl -n atoll logs deployment/atoll-server | grep verify-email
+atoll login --server http://atoll.localhost
+atoll deploy
+```
+
+Browsers and curl resolve `*.localhost` to `127.0.0.1`, so with these values:
+
+| URL | Served by |
+|-----|-----------|
+| `http://atoll.localhost` | API and panel (`atoll-server` Ingress) |
+| `http://<project>.apps.atoll.localhost` | the project's primary Ktor module (Ingress `<project>` in `atoll-apps`) |
+| `http://<project>--<module>.apps.atoll.localhost` | every Ktor module, the primary one included (Ingress `<project>--<module>`) |
+| `http://<project>-web.apps.atoll.localhost` | the project's primary web app, served by atoll-server from object storage |
+| `http://<project>-web--<module>.apps.atoll.localhost` | the project's other web apps, served the same way |
+
+Apps live one level below the API host so the panel's session cookie never reaches them. `<module>` is the Gradle
+path as a DNS label: `:apps:server` becomes `apps-server`, the root project `root`. Names longer than 17 characters,
+and modules whose names would collide, are shortened to 10 characters plus a hash, e.g. `my-very-lo-1a2b3c`. The
+primary Ktor module is the one named by the Gradle property `atoll.primary` (e.g. `atoll.primary=:apps:api` in
+`gradle.properties`), otherwise the shallowest one, ties broken by path. The primary web app is chosen the same
+way, without an override.
+
+The wildcard Ingress `*.apps.atoll.localhost` (`atoll-sites`) sends every app host to atoll-server, which serves
+web apps by `Host` header. Exact-host Ingresses of Ktor modules take precedence over it (ingress-nginx prefers exact
+hosts; with Traefik the chart gives the wildcard the lowest priority).
+
+To debug a build: `kubectl -n atoll-builds get jobs,pods` and
+`kubectl -n atoll-builds logs job/atoll-build-<id> -c build` (or `-c publish`). Finished Jobs are deleted after an
+hour.
+
+## How a build runs
+
+1. The replica that receives the upload checks the project's storage quota, stores the source in object storage,
+   records itself as the deployment's owner and creates `Job atoll-build-<id>` with two random tokens, one per
+   container.
+2. The init container `build` runs the user's Gradle build. It downloads the source from
+   `ATOLL_INTERNAL_URL/internal/builds/<id>/source`, runs Gradle, uploads the project model, web apps and
+   artifacts, and leaves one image layer per Ktor module in a shared emptyDir. Its token can do nothing else
+   except report a failure.
+3. The container `publish` pushes those layers to the registry with crane, then reports the images and the
+   build's success. Only `publish` holds the registry credentials and the token that may report images and
+   success; it runs as another uid with a read-only root filesystem, gets none of the project's build env vars,
+   and only hands the layer files to crane as data.
+4. The owning replica tails both containers' logs into the deployment log, rolls out every Ktor module and marks
+   the deployment ready (or partial, if some targets failed while others went live). Rollouts of one project never
+   overlap, even across replicas (a Postgres advisory lock).
+
+Build pods call the server on its **internal port** (`ATOLL_INTERNAL_PORT`, 8081), which serves the build
+protocol and nothing else; `/internal` answers 404 on the API port. Build pods can't reach the API port at all, so
+untrusted build code can never talk to the API, e.g. with a forged `X-Forwarded-For` that the API trusts from the
+ingress controller. Calls may land on any replica: callbacks are stored in Postgres and files in object storage.
+
+Uploads are held to limits, so a small archive can't unpack into gigabytes on the server's disk. A build may upload
+`ATOLL_BUILD_MAX_OUTPUT_BYTES` in total (web apps counted unpacked; a retried upload replaces the earlier one), no
+single file may exceed `ATOLL_BUILD_MAX_FILE_BYTES`, and a web app may have at most `ATOLL_BUILD_MAX_SITE_FILES`
+entries. Bytes are counted as they arrive and unpack. An upload past a limit is answered with 413 and fails the
+build with a message naming the setting, which shows in the deployment log. The server's scratch volume must hold
+what builds upload at once (`server.scratchSize` in the chart).
+
+The owner renews a lease on its deployments every 10 seconds. If a replica dies, another one marks its unfinished
+deployments `FAILED` after 60 seconds ("Interrupted because the server running it stopped").
+
+Ktor images are pushed as `<ATOLL_REGISTRY_PUSH>/atoll/<project>/<module>:<deployment id>`. `publish` reports each
+image with the digest crane computed for what it pushed (`...:<deployment id>@sha256:...`, never looked up by tag),
+and app Deployments reference that digest (`imagePullPolicy: IfNotPresent`), so a later push to the same tag never
+changes a running app; promotions roll out the same digest again. Deployments from before digest pinning can only
+be promoted with `--rebuild`. The server only accepts digest-pinned images under the build's own project and tagged
+with its deployment id, and rejects the same image reported for two modules. It also refuses builder images older
+than itself, with a message naming `ATOLL_BUILDER_IMAGE`: the server and the builder image are upgraded together.
+
+## App resources
+
+Each Ktor module gets a Deployment, Service, HorizontalPodAutoscaler and Ingress named `<project>--<module>`,
+labelled `atoll.app/project=<project>` and `atoll.app/module=<module>` (the selector of the Deployment and Service)
+and annotated with the Gradle path (`atoll.app/module-path`). The primary module also gets an Ingress named
+`<project>` for the bare host; it is switched to a new primary only after that module's rollout completed. Rollouts
+are watched per module, so a module that crashes fails only its own target.
+
+The module's runtime env vars live in a Secret `<project>--<module>-env`, owned by its Deployment, and reach the pods
+through `envFrom`; the Deployment spec holds no values. The pod template carries a checksum of the env vars
+(`atoll.app/env-checksum`), so changing only an env var still rolls the pods. Values are passed as they are (no
+`$(VAR)` expansion). Apps deployed before this keep their inline env until their next deployment.
+
+After all targets of a deployment are processed, the platform deletes the resources of Ktor modules that are no longer in
+the project (their env Secret goes with the Deployment). Modules that are still in the project but failed to build
+or roll out keep their previous instance, and so does the module the bare host still routes to until a new primary
+module takes it over. A deployment whose build finishes after a newer deployment of the same project was already
+rolled out deploys no Ktor modules (they are reported as skipped) and deletes nothing.
+
+```sh
+kubectl -n atoll-apps get deploy,svc,hpa,ingress -l atoll.app/project=<project>
+```
+
+### Scaling
+
+Each production Ktor module has a size, replica bounds and scale to zero, set on the panel's Scaling tab or with
+`PUT /api/projects/<project>/scaling` (developers; members read them). Changes are applied to the running app at
+once; a new size rolls its pods. Previews always run `xs` with one replica.
+
+| Size | vCPU | Memory |
+|------|------|--------|
+| `xs` | 0.25 | 512 MB |
+| `s` | 0.5 | 1 GB |
+| `m` | 1 | 2 GB |
+| `l` | 2 | 4 GB |
+| `xl` | 4 | 8 GB |
+
+The size is both the requests and the limits of the app container, and the JVM gets
+`JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75.0` unless the project sets `JAVA_TOOL_OPTIONS` itself. Billing counts the
+requests of running app pods once a minute, so a module costs its size times its running replicas, and nothing
+while it is scaled to zero. The HPA keeps the replicas between the bounds (70% CPU target). Free orgs run up to `s`
+and `ATOLL_SCALING_FREE_MAX_REPLICAS` replicas, and scale to zero by default; pay-as-you-go orgs run any size up to
+`ATOLL_SCALING_MAX_REPLICAS`. Without billing there are no plan limits.
+
+**Scale to zero** uses [KEDA](https://keda.sh) and its [HTTP add-on](https://github.com/kedacore/http-add-on). For a
+module that scales to zero, the platform creates an `HTTPScaledObject` instead of the HPA, and an ExternalName Service
+`w--<project>--<module>` pointing at the add-on's interceptor; the module's Ingresses (and the bare host's) lead to
+that Service. The interceptor holds each request until a replica is ready, so the first request after an idle
+period waits for the app to start (a few seconds for a small JVM app). After `ATOLL_SCALING_IDLE_MINUTES` without
+requests KEDA scales the module back to zero. A deploy starts one replica so the rollout shows the new version
+works; it goes back to zero once idle.
+
+```
+ Ingress shop ──► Service w--shop--api (ExternalName) ──► KEDA interceptor ──► Service shop--api ──► pods (0..max)
+                                                              │ request count
+                                                              ▼
+                                                  HTTPScaledObject shop--api ──► KEDA scales the Deployment
+```
+
+It degrades on its own: with `ATOLL_SCALING_SCALE_TO_ZERO=off`, or while the cluster has no `HTTPScaledObject` API
+(checked once a minute), modules keep their HPA and their Ingresses lead straight to their Service; the panel then
+says scale to zero isn't available and the API refuses to turn it on. Suspended projects never wake: their
+`HTTPScaledObject` is removed while suspended and comes back when they resume.
+
+Custom domains lead to the module's own Service, not through the interceptor, which only knows the module's
+hosts. A request on a custom domain alone does not wake a module that scaled to zero (it gets a 503 until the
+module runs again), so keep scale to zero off for modules that are mainly reached on a custom domain.
+
+The self-hosted helmfile installs KEDA and the add-on in the `keda` namespace (`scaleToZero.enabled`); the chart
+grants the server `httpscaledobjects` in the apps namespace and lets the interceptor reach app pods. Traefik must
+follow ExternalName Services (`providers.kubernetesIngress.allowExternalNameServices`, already set for custom
+domains).
+
+### Upgrading from single-app deployments
+
+Earlier versions deployed one Ktor app per project, with every resource named `<project>` and a selector without a
+module label. A selector cannot be changed in place, so the next deployment creates the new `<project>--<module>`
+resources next to the old ones. Once the primary module's rollout completed and its Ingress `<project>` took over
+the bare host, the old Deployment, Service and HPA named `<project>` are deleted. If the primary module fails, the
+old app keeps serving the bare host until a later deployment succeeds. Before the first module rolls out, the platform
+limits the old Service to the old app's pods (`app.kubernetes.io/name=<project>`) and deletes the old HPA, which
+would count the new pods too.
+
+Project names containing `--` or ending in `-web` are no longer accepted, because those hosts now belong to modules
+and web apps of other projects. Apps deployed under such names can't be redeployed or pruned by the platform and shadow
+the new names. Find and delete them by hand:
+
+```sh
+kubectl -n atoll-apps get deploy -l app.kubernetes.io/managed-by=atoll -L atoll.app/project
+kubectl -n atoll-apps delete deploy,svc,hpa,ingress -l atoll.app/project=<old-name>
+```
+
+## Isolation
+
+Builds run arbitrary Gradle code and apps run arbitrary Ktor code, so both are locked down:
+
+- Pods have no service account token, run as non-root (uid 10001 for `build`, 10002 for `publish`) without
+  privilege escalation, with all capabilities dropped, `RuntimeDefault` seccomp, CPU and memory limits, and only
+  emptyDir volumes plus read-only Secrets (build env vars for `build`, registry push credentials for `publish`).
+  Build Jobs have a deadline and `backoffLimit: 0`. Both workload namespaces enforce the `restricted` Pod Security
+  Standard.
+- The `atoll-builds` NetworkPolicy blocks all inbound traffic and allows outbound traffic only to DNS, the server's
+  internal port, the bundled registry and port 443 on public addresses (Gradle and Maven repositories). App pods
+  accept traffic only from the ingress controller and reach only public addresses. NetworkPolicies need a CNI that
+  enforces them (kindnet in recent kind releases, k3s' built-in controller, Calico, Cilium); otherwise they are
+  silently ignored.
+- The server holds Secret rights only for what it manages: one env Secret per build in `atoll-builds` and one per
+  app in `atoll-apps` (it never lists Secrets there), and TLS Secrets of custom domains (delete only).
+
+For anything beyond a trusted team, also:
+
+- **Run builds on their own nodes.** Label and taint a node pool for builds and set `builds.nodeSelector` and
+  `builds.tolerations` (`ATOLL_BUILD_NODE_SELECTOR`, `ATOLL_BUILD_TOLERATIONS`), so build pods never share a node
+  with the server, Postgres or object storage. See
+  [Keep builds on their own nodes](/self-hosting/install#keep-builds-on-their-own-nodes).
+- **Sandbox builds with [gVisor](https://gvisor.dev/).** Install `runsc` on the build nodes, register it with
+  containerd and set `builds.runtimeClass` (`ATOLL_BUILD_RUNTIME_CLASS=gvisor`); the chart can create the
+  RuntimeClass. See [gVisor for builds](/self-hosting/install#2-optional-gvisor-for-builds). Builds are noticeably
+  slower under gVisor, mostly from file system overhead. On kind, install `runsc` inside each node container
+  (`docker exec`), add the runtime to `/etc/containerd/config.toml` and restart containerd in the node.
+
+Without accounts and Kubernetes (`ATOLL_RUNTIME=local`), builds and apps run as processes on the server's own host.
+That is for local development only: with a database (accounts on) the server refuses to start in local mode unless
+`ATOLL_ALLOW_LOCAL_BUILDS=true`.
+
+## Configuration
+
+With the chart you set these through values; [Configuration](/self-hosting/configuration#chart-values)
+maps each value to its variable. The database:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_DATABASE_URL` | unset; required in Kubernetes mode | JDBC URL of the platform's Postgres, e.g. `jdbc:postgresql://atoll-postgres.atoll.svc.cluster.local:5432/atoll`. With it, accounts are on |
+| `ATOLL_DATABASE_USER` | unset | database user |
+| `ATOLL_DATABASE_PASSWORD` | unset | database password |
+| `ATOLL_DATABASE_WAIT_SECONDS` | `120` | how long startup waits for Postgres before giving up |
+
+The server applies schema migrations on start.
+
+Object storage:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_STORAGE_BUCKET` | unset | bucket for sources, web apps and artifacts; created if missing. Unset keeps files in `ATOLL_DATA_DIR`, which allows only one replica |
+| `ATOLL_STORAGE_ENDPOINT` | unset | S3 endpoint, e.g. `http://atoll-storage.atoll.svc.cluster.local:8333`; unset means AWS S3 |
+| `ATOLL_STORAGE_REGION` | `us-east-1` | bucket region (`auto` for Cloudflare R2) |
+| `ATOLL_STORAGE_ACCESS_KEY` / `ATOLL_STORAGE_SECRET_KEY` | unset | keys; without them the AWS default credentials chain is used |
+| `ATOLL_STORAGE_PATH_STYLE` | `true` when an endpoint is set | `bucket` in the path instead of the host name |
+| `ATOLL_STORAGE_WAIT_SECONDS` | `120` | how long startup waits for the storage endpoint to accept connections before giving up |
+
+The Kubernetes runtime:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_INTERNAL_URL` | `http://atoll-server.atoll.svc.cluster.local:<ATOLL_INTERNAL_PORT>` | how build pods reach the server's internal port |
+| `ATOLL_BUILD_NAMESPACE` | `atoll-builds` | namespace for build Jobs |
+| `ATOLL_APPS_NAMESPACE` | `atoll-apps` | namespace for Ktor apps |
+| `ATOLL_BUILDER_IMAGE` | `atoll/builder:latest` | image of the build pods; the chart uses the release image of its version |
+| `ATOLL_REGISTRY_PUSH` | required | registry build pods push app images to |
+| `ATOLL_REGISTRY_PULL` | the push value | the same registry as nodes reach it, for image references in app Deployments |
+| `ATOLL_REGISTRY_INSECURE` | `false` | push over plain HTTP (only an in-cluster test registry) |
+| `ATOLL_REGISTRY_PUSH_SECRET` | unset | `kubernetes.io/dockerconfigjson` Secret in the builds namespace, mounted read-only into the `publish` container only. Its `auths` key is the push host |
+| `ATOLL_REGISTRY_PULL_SECRET` | unset | dockerconfigjson Secret in the apps namespace, the `imagePullSecrets` of app pods. Its `auths` key is the pull host |
+| `ATOLL_BUILDER_PULL_SECRET` | unset | dockerconfigjson Secret in the builds namespace for a private builder image |
+| `ATOLL_BUILD_RUNTIME_CLASS` | unset | RuntimeClass for build pods, e.g. `gvisor` |
+| `ATOLL_BUILD_NODE_SELECTOR` | unset | JSON object of node labels for build pods, e.g. `{"atoll.app/pool":"builds"}` |
+| `ATOLL_BUILD_TOLERATIONS` | unset | JSON array of tolerations for build pods, e.g. `[{"key":"atoll.app/builds","operator":"Exists","effect":"NoSchedule"}]` |
+| `ATOLL_INGRESS_CLASS` | `nginx` | `ingressClassName` of app Ingresses; the chart sets its `ingress.className` (`traefik`) |
+| `ATOLL_BUILD_TIMEOUT` | `1800` | seconds before a build is killed |
+| `ATOLL_BUILD_CPU` / `ATOLL_BUILD_MEMORY` | `2` / `6Gi` | requests and limits of a build pod |
+| `ATOLL_MAX_BUILDS` | `2` | builds at once **per replica** |
+| `ATOLL_BUILD_MAX_OUTPUT_BYTES` | `2147483648` (2 GiB) | bytes of web apps (unpacked) and artifacts one build may upload |
+| `ATOLL_BUILD_MAX_FILE_BYTES` | `1073741824` (1 GiB) | bytes of one artifact or one file of a web app |
+| `ATOLL_BUILD_MAX_SITE_FILES` | `20000` | files, directories and links in one web app |
+
+Scaling (see [Scaling](#scaling)):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_SCALING_SCALE_TO_ZERO` | `keda` | `keda` lets modules scale to zero through the KEDA HTTP add-on wherever the cluster has its `HTTPScaledObject` API; `off` never does |
+| `ATOLL_SCALING_INTERCEPTOR` | `keda-add-ons-http-interceptor-proxy.keda.svc.cluster.local:8080` | `host:port` of the add-on's interceptor proxy Service |
+| `ATOLL_SCALING_IDLE_MINUTES` | `5` | minutes without requests before a module scales to zero |
+| `ATOLL_SCALING_MAX_REPLICAS` | `10` | the most replicas any module may run |
+| `ATOLL_SCALING_FREE_MAX_REPLICAS` | `3` | the most replicas a module of a free org may run |
+
+A missing push secret, or one that is not of type `kubernetes.io/dockerconfigjson` with a `.dockerconfigjson` key,
+fails a build right away. App Deployments get a new pull secret on their next rollout; redeploy every Ktor app once
+after setting `ATOLL_REGISTRY_PULL_SECRET` if the registry now requires a login. See
+[Registry](/self-hosting/registry) for the self-hosted setup.
+
+## Regions
+
+A region is a Kubernetes cluster that runs Ktor apps. Any cluster works, whoever hosts it. The cluster the server
+runs in is the built-in **home** region, so an install without regions works as before: every project runs at home.
+Platform admins (`ATOLL_AUTH_ADMIN_EMAILS`) add more regions in the panel (Admin, Regions) or through
+`/api/admin/regions`, each with:
+
+- an **id** (`eu-west`) and a name;
+- an **apps domain**: the region's Ktor apps are served on `<project>.<domain>` and `<project>--<module>.<domain>`;
+- a **kubeconfig** with inline credentials (a service account token is best). It is stored encrypted with
+  `ATOLL_REGIONS_SEAL_KEY`; kubeconfigs that read files or run credential plugins (`exec`, `auth-provider`) are
+  refused, since they would run on the server;
+- optionally a **registry** address the region's nodes pull app images from, and a **Prometheus URL** its metrics are
+  read from;
+- optionally a **country** (a two-letter ISO 3166-1 code such as `de`, or `eu`), shown as a flag next to the region
+  in the panel. Without one the panel guesses it from the region's name and id.
+
+New projects go to the region picked when they are created, or to the default region. A **draining** region keeps
+running its projects but takes no new ones (and no moves); the default region can't be drained. A region can only be
+removed once no project runs in it.
+
+```
+                     home cluster (server)                     region cluster (eu-west)
+ ┌─────────── atoll ────────────┐   ┌── atoll-builds ──┐      ┌──── atoll-apps ─────────────┐
+ │ atoll-server ── kubeconfig ──┼───┼──────────────────┼─────▶│ Deployment shop--server     │
+ │ atoll-registry ◀── push ─────┼───┤ Job atoll-build  │      │ Ingress shop.eu.example.com │
+ └──────────────▲───────────────┘   └──────────────────┘      └──────────────┬──────────────┘
+                └────────────────── image pull (nodes) ───────────────────────┘
+```
+
+### How it works
+
+- **Builds stay at home.** Build Jobs run in the home cluster and push to its registry; only the rollout goes to the
+  project's region. Every region must be able to pull from that registry (see below).
+- **Apps run in the project's region.** The server wraps one Kubernetes runtime per region (`RegionalAppRuntime`):
+  rollouts, prunes, app logs, suspension when billing stops a project, preview retirement and project deletion are
+  sent to the cluster of the project's region, with the region's apps domain and registry address.
+- **Web apps stay at home.** The server itself serves web targets (`<project>-web.<home apps domain>`), whatever the
+  project's region; so do downloads of Android and desktop artifacts.
+- **Custom domains** of Ktor apps get their Ingress, ExternalName Service and certificate in the region's cluster, and
+  must CNAME to `cname.<region domain>`; web domains keep pointing at the home cluster. A project with custom domains
+  can't move; remove them first.
+
+### Moving a project
+
+Admins of a project's org change its region on the project's Scaling tab (or `PUT /api/projects/<name>/region`).
+The platform records the new region, then promotes the live production deployment: its images roll out again in the new
+region (rebuilt if they predate digest-pinned images). The old region keeps serving until that deployment is live,
+then its apps there are removed. The app URLs change to the new region's domain. A project with nothing live just
+changes region. Moves are refused while a deployment runs. Previews of the project are removed from the old region
+with its other apps; they are deployed again by the next push to their pull request.
+
+### Setting up a region cluster
+
+1. Create the apps namespace (`atoll-apps`, or `ATOLL_APPS_NAMESPACE`) with an ingress controller of the same class as
+   the home cluster (`ATOLL_INGRESS_CLASS`), metrics-server for the autoscalers, and cert-manager with the
+   `ATOLL_DOMAINS_CLUSTER_ISSUER` if projects there use custom domains.
+2. Create a ServiceAccount with the rights the chart gives the server in its own apps namespace
+   (`deploy/helm/atoll/templates/rbac.yaml`: deployments, services, ingresses, HPAs, secrets, pods and `pods/log`),
+   and a kubeconfig with its token. For custom domains it also needs ingresses, services and secrets in the domains
+   namespace (`atoll-domains`) and read access to cert-manager Certificates there.
+3. Make the home registry pullable from the region's nodes: expose it (for example on a public hostname with TLS and
+   the chart's pull credentials) and set the region's **registry** to that address if it differs from
+   `ATOLL_REGISTRY_PULL`. Copy the pull secret (`ATOLL_REGISTRY_PULL_SECRET`, `atoll-registry-pull` with the chart)
+   into the region's apps namespace. An external registry that every cluster reaches avoids both steps.
+4. Point a wildcard DNS record `*.<region domain>` (and `cname.<region domain>` for custom domains) at the region's
+   ingress. TLS for app hosts comes from the ingress controller's default certificate, as at home, so give the
+   region's controller a wildcard certificate for its domain.
+5. Add the region in the panel and use **Test connection**: it checks that the API answers, the apps namespace exists
+   and the credentials may create Deployments, Services, Ingresses and Secrets there. It also checks storage (the
+   `atoll-storage` namespace, the server's rights there and CloudNativePG); without it the region runs apps but no
+   stores, see [selfhost/storage.md](/self-hosting/storage#regions).
+6. Install the firewall edge: the chart with `mode: edge` (example: `deploy/helm/atoll/ci/edge-values.yaml`) puts
+   `atoll-edge` into the region and gives the home server its rights there. A region without it serves its apps
+   unfiltered, see [selfhost/firewall.md](/self-hosting/firewall).
+
+Set the same `ATOLL_REGIONS_SEAL_KEY` on every server replica (with the chart, through a Secret in
+`server.extraEnvFromSecrets`). Without it the server starts and runs everything at home, but refuses to store a
+kubeconfig. Regions need `ATOLL_RUNTIME=kubernetes`: only then do builds produce images another cluster can run.
+
+`e2e/regions.sh` sets up two k3d clusters on one docker network this way and deploys a sample into the second.
+
+## Serving web apps through a CDN
+
+Web apps are static files, so a CDN can serve most requests. Point the CDN (Cloudflare, CloudFront, ...) at the
+ingress for `*-web.<apps domain>` hosts and keep the `Host` header. The platform's responses tell it what to keep:
+
+| Files | `Cache-Control` |
+|-------|-----------------|
+| `*.html` | `no-cache`: always revalidated, so a new deployment shows up at once |
+| names with a content hash, e.g. `app.3f2a9c1b.js` | `public, max-age=31536000, immutable` |
+| everything else | `public, no-cache`: cached, revalidated with the ETag (a `304` costs the server no body) |
+
+## Limitations
+
+- A deployment runs on the replica that received it. When that replica stops (a crash, or a rolling update of
+  the platform itself), its unfinished deployments fail and must be deployed again; another replica does not take them
+  over.
+- The bundled Postgres, SeaweedFS and zot run as single pods without backups, fine for development. Use the
+  self-hosting setup or managed services in production.
+- Every build pushes with the same registry credentials, so a malicious build could push to another project's
+  repository. Apps only run digests their own builds reported, but use a registry with per-project credentials
+  before running untrusted builds for many tenants ([Registry](/self-hosting/registry)).
+- App pods only accept traffic from the ingress controller, so Ktor modules of one project reach each other through
+  their public hosts, not cluster DNS.

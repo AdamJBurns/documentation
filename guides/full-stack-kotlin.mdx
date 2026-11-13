@@ -1,0 +1,105 @@
+---
+title: "Full-stack Kotlin in one deploy"
+description: "This guide deploys a project with two Ktor servers, a Compose web app and an Android app, all from one Gradle build and one command."
+---
+It assumes you have deployed a single server before. If not, start with [Deploy a Ktor server](/guides/deploy-a-ktor-server).
+
+## The project
+
+```text
+shop/
+├── gradlew
+├── settings.gradle.kts
+├── gradle.properties
+├── api/            Ktor server: the public API
+├── admin/          Ktor server: an internal admin tool
+├── composeApp/     Compose Multiplatform: wasmJs web app
+└── androidApp/     Android app
+```
+
+`settings.gradle.kts` includes every module:
+
+```kotlin
+include(":api", ":admin", ":composeApp", ":androidApp")
+```
+
+Each module only needs its usual Gradle setup. See [Ktor servers](/targets/server), [Web apps](/targets/web) and [Android apps](/targets/android) for what the platform looks for.
+
+## Pick the primary server
+
+Both `:api` and `:admin` are Ktor servers at the same depth. Without a setting, `:admin` would get the bare host, because it comes first in alphabetical order. Put `:api` there instead, in `gradle.properties`:
+
+```properties
+atoll.primary=:api
+```
+
+See [The primary module](/primary-module).
+
+## Tell the web app where the API is
+
+The web app is static: it learns the API URL when it is built. Set a build-only variable:
+
+```sh
+atoll env set API_URL=https://shop.atoll.app --no-runtime --project shop
+```
+
+Then read it in `composeApp/build.gradle.kts` and turn it into a constant, for example with a small generated source:
+
+```kotlin
+val apiUrl = providers.environmentVariable("API_URL").orElse("http://localhost:8080")
+
+val generateConfig by tasks.registering {
+    val out = layout.buildDirectory.dir("generated/config")
+    val url = apiUrl
+    outputs.dir(out)
+    doLast {
+        val file = out.get().file("Config.kt").asFile
+        file.parentFile.mkdirs()
+        file.writeText("const val API_URL = \"${url.get()}\"\n")
+    }
+}
+
+kotlin {
+    sourceSets.commonMain {
+        kotlin.srcDir(generateConfig)
+    }
+}
+```
+
+The web app and the API are on different hosts, so the API needs Ktor's CORS plugin to allow requests from the web app's host.
+
+## Deploy
+
+```sh
+atoll deploy --name shop
+```
+
+```text
+Deployment 3c9e41a0-5d2b-4f7e-9a61-0b8d2c7e4f15 READY
+
+  KTOR     :api         READY  primary  https://shop.atoll.app/
+  KTOR     :admin       READY           https://shop--admin.atoll.app/
+  WEB      :composeApp  READY  primary  https://shop-web.atoll.app/
+  ANDROID  :androidApp  READY
+      note: Debug build: for a signed release APK and App Bundle, set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD in the project's build env vars.
+      androidApp-debug.apk (6.1 MB)  https://atoll.example.com/api/deployments/3c9e41a0-…/artifacts/androidApp-debug.apk
+```
+
+All four targets build in one deployment. If one fails, the others still go live and the deployment is `PARTIAL`.
+
+## Previews with their own API
+
+When you [link the repository](/deploy/git), every pull request gets a preview with its own hosts. Point the preview web app at a preview-safe API by setting `API_URL` for the preview environment:
+
+```sh
+atoll env set API_URL=https://staging-api.example.com --env preview --no-runtime --project shop
+```
+
+## Add your domains
+
+```sh
+atoll domains add api.shop.example --project shop
+atoll domains add shop.example --web --project shop
+```
+
+Then update `API_URL` to the new API domain and deploy again. See [Custom domains](/configure/custom-domains).

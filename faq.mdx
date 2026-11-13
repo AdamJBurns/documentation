@@ -1,0 +1,70 @@
+---
+title: "FAQ"
+---
+## Do I need to change my build?
+
+Usually not. The platform reads your Gradle build as it is. You need the Gradle wrapper at the root, and your Ktor servers must listen on the `PORT` env var. See [Ktor servers](/targets/server#listen-on-port).
+
+## Which Gradle and Kotlin versions work?
+
+The ones your project uses. The platform builds with your project's Gradle wrapper.
+
+## Does the platform build iOS apps?
+
+Yes, as an unsigned simulator app, when a macOS build runner is connected to your org. Signed device builds (`.ipa`) are not available yet. Without a macOS runner the iOS target is skipped and the rest of your project deploys. See [iOS](/targets/ios).
+
+## Does the platform publish to Google Play or the App Store?
+
+The platform can upload signed Android App Bundles to the internal testing track of Google Play; see [Google Play](/targets/android#google-play). It does not publish to production tracks or to the App Store. Android and desktop builds are always attached to the deployment as downloads.
+
+## How do I get a signed Android build?
+
+Store your keystore and its passwords in four secret env vars. The platform then builds and signs the release APK; without them you get a debug APK. See [Android signing](/targets/android#signing).
+
+## My deployment is PARTIAL. What is live?
+
+Every target marked `READY`. The failed targets keep their previous version. Fix them and deploy again. See [Deployments](/deploy/deployments).
+
+## Why was a target SKIPPED?
+
+The platform could not build it in this environment, for example an iOS target without a macOS build runner, or an Android target on a self-hosted server without an Android SDK. The reason is shown next to the target. Skipped targets do not make a deployment fail.
+
+## Why does my deployment say "No deployable targets found"?
+
+The platform found no Ktor server, web app, Android app or desktop app in the build. Check the rules in [Project structure](/project-structure#how-targets-are-detected).
+
+## Which Ktor server gets my project's main URL?
+
+The primary module. By default it is the shallowest Ktor module; set `atoll.primary` to choose. See [The primary module](/primary-module).
+
+## How do I roll back?
+
+Run `atoll rollback`, or promote an older deployment with `atoll promote <id>`. See [Promote and rollback](/deploy/promote-and-rollback).
+
+## I changed an env var. Why did nothing happen?
+
+Changes apply on the next deployment. To apply them now, deploy again or use **Redeploy production** in the panel's **Env** tab. See [Environment variables](/configure/environment-variables#when-changes-apply).
+
+## Can I see a secret's value again?
+
+No. Secret values are write-only. Set a new value if you lost the old one.
+
+## Do previews use my production env vars?
+
+No. Previews use the `preview` environment's values.
+
+## Why was my deployment refused?
+
+Your org used up a free amount on the free plan, or reached its spend limit. The message says which and links to the **Billing** tab. Add a card or raise the limit there. See [Billing](/teams/billing).
+
+## Why did my app stop?
+
+On the free plan, using up the free CPU, memory or bandwidth stops the org's running apps until the next month, or until a card is added. Reaching a spend limit does the same. Apps never stop on their own otherwise. See [What happens at a limit](/teams/billing#what-happens-at-a-limit).
+
+## Can I run the platform myself?
+
+Yes. The platform is a single Ktor server that builds and runs apps on a Kubernetes cluster. The [self-hosting guide](/self-hosting/overview) installs it on your own servers. Get in touch through the Enterprise page if you want help with it.
+
+## How do I get help?
+
+Email hello@atoll.app.

@@ -1,0 +1,102 @@
+---
+title: "Storage"
+description: "What backs users’ Postgres, Redis and Files stores, and how to configure them or turn them off."
+---
+Users create Postgres, Redis and Files stores in the panel and connect them to their projects. Stores run in the cluster of their region, in the namespace
+`atoll-storage`. This page covers what the self-hosted install adds for that and how to turn it off.
+
+```
+                          atoll-storage (Pod Security: baseline)  
+ atoll-apps                ┌────────────────────────────────────────────────────────────┐
+  app pods ── 5432 ───────►│ st-<id>  Postgres (CloudNativePG Cluster) ── WAL, base ──┐ │
+  (connected  ── 6379 ────►│ st-<id>  Redis (Valkey StatefulSet)          backups     │ │
+   projects)  ── 8333 ────►│ atoll-files-s3  Files SeaweedFS (S3) ◄───────────────────┘ │
+                           └──────────────▲─────────────────────────────────────────────┘
+ Traefik: https://s3.<apps domain> ───────┘          cnpg-system: CloudNativePG + Barman Cloud plugin
+```
+
+## What gets installed
+
+| Piece | Where | From |
+|-------|-------|------|
+| Namespace `atoll-storage` | | `scripts/create-storage-secrets.sh` (helmfile) or the chart (`namespaces.create`) |
+| CloudNativePG operator and Barman Cloud plugin | `cnpg-system` | helmfile (also used by `atoll-db`) |
+| Files SeaweedFS, Service `atoll-files-s3:8333` | `atoll-storage` | helmfile release `atoll-files` |
+| Role `atoll-server`: Secrets, Services, PVCs, StatefulSets, NetworkPolicies, CNPG Clusters and ScheduledBackups, Barman ObjectStores (manage), CNPG Backups and Jobs (list), pods (read, delete when stuck; no exec) | `atoll-storage` | chart |
+| ClusterRole `atoll-server-storageclasses`: StorageClasses (get) | cluster | chart (`rbac.storageClasses`) |
+| NetworkPolicy `atoll-stores` | `atoll-storage` | chart |
+| Ingress `atoll-files-s3` for `s3.<apps domain>` | `atoll-storage` | chart |
+| Server settings `ATOLL_DATASTORE_*` | ConfigMap `atoll-config` | chart (`features.datastore`) |
+
+The stores themselves (named `st-<id>`, labelled `atoll.app/store` and `atoll.app/org`) are created by atoll-server.
+
+## Secrets
+
+`create-secrets.sh` runs `create-storage-secrets.sh`, which can also be run alone on an existing install. It keeps
+Secrets that already exist.
+
+| Secret | Holds |
+|--------|-------|
+| `atoll/atoll-files-admin` | `access-key`, `secret-key`: the S3 admin atoll-server uses to create Files buckets and their keys (`ATOLL_DATASTORE_FILES_ACCESS_KEY` / `_SECRET_KEY`) |
+| `atoll-storage/atoll-store-backups` | `ACCESS_KEY_ID`, `ACCESS_SECRET_KEY`: Postgres backups, allowed only on bucket `atoll-store-backups` |
+| `atoll-storage/atoll-files-s3-config` | `seaweedfs_s3_config`: the S3 identities of the Files SeaweedFS, made from the two above |
+
+Postgres backups go to bucket `atoll-store-backups` on the Files SeaweedFS (`ATOLL_DATASTORE_BACKUP_*`), so they
+live in the same cluster as the stores. Copy that bucket off-site like the platform's own (see
+[backups.md](/self-hosting/backups#object-storage)), or point `features.datastore.backups` at an external S3 bucket and put
+its keys in the `atoll-store-backups` Secret.
+
+## Public Files endpoint
+
+Files stores are reachable from outside at `https://s3.<apps domain>` (`ATOLL_DATASTORE_FILES_PUBLIC_ENDPOINT`):
+signed requests and presigned URLs work, and buckets with public read answer anonymous reads.
+
+- **DNS**: nothing to add, the wildcard record `*.<apps domain>` already covers `s3`.
+- **TLS**: the wildcard certificate, served as Traefik's default certificate like app hosts. With ingress-nginx
+  set it as `--default-ssl-certificate`.
+- `s3` can't clash with a project: project names are at least three characters long.
+
+Set `features.datastore.files.publicEndpoint` and `files.ingress.enabled: false` to publish it elsewhere.
+
+## Network
+
+- App pods may connect to `atoll-storage` on 5432, 6379 and 8333 (`atoll-apps` policy). Postgres and Redis pods
+  only let in the app pods of projects connected to them, through a policy per store that atoll-server keeps.
+- Files S3 (8333) accepts every app pod and the ingress controller: requests are signed per bucket, as on the public
+  host.
+- Everything else in `atoll-storage` accepts only its own namespace (replicas, backups to the Files S3), atoll-server
+  (5432, 6379, 8333: usage probes, buckets, backup sizes; the stores' own policies admit it from
+  `ATOLL_DATASTORE_SERVER_NAMESPACE`, the release namespace), the CloudNativePG operator (5432, 8000) and `networkPolicy.storage.monitoringNamespaces` on
+  the metrics ports (9187, 9121, 9327). The chart restricts no egress there: Postgres pods archive WAL to the Files
+  S3 and talk to the Kubernetes API; Redis pods get a deny-all egress policy from their engine.
+
+## Disks and resizing
+
+Stores get PersistentVolumeClaims of `features.datastore.storageClass` (`ATOLL_DATASTORE_STORAGE_CLASS`; per kind
+`ATOLL_DATASTORE_REDIS_STORAGE_CLASS` through `features.datastore.config`), or the cluster default. Growing a store
+resizes its claims, which needs a StorageClass with `allowVolumeExpansion: true` and a driver that can expand
+volumes (Longhorn, a cloud CSI driver, OpenEBS LVM...). k3s' `local-path` (also used by
+`deploy/selfhost/local/k3d.sh`) can't: it ignores sizes and has no resizer, so resizes are refused with a clear
+message (the server reads the StorageClass, `rbac.storageClasses`).
+
+Images default to the engines' own; `ATOLL_DATASTORE_POSTGRES_IMAGE` and `ATOLL_DATASTORE_REDIS_IMAGE` (in
+`features.datastore.config`) pin others.
+
+## Regions
+
+Every region that should run stores needs the same pieces in its cluster: CloudNativePG with the Barman Cloud
+plugin, the `atoll-storage` namespace with the Files SeaweedFS, the Secrets `atoll-store-backups` (Postgres backups
+fail without it) and `atoll-files-s3-config`, and the Role above (plus the StorageClass ClusterRole) bound to the
+region's service account. **Test connection** on the region (Admin, Regions) checks the namespace, the rights and the
+operators. A region without them still runs apps; the test then says why storage is off there.
+
+## Turning it off
+
+```sh
+STORAGE=false deploy/selfhost/scripts/create-secrets.sh
+helmfile -e default --state-values-file my-site.yaml --state-values-set datastore.enabled=false sync
+```
+
+With the chart alone set `features.datastore.enabled: false`. The server then answers that storage is turned off
+(`ATOLL_DATASTORE_ENABLED=false`), and the chart creates no storage namespace, Role or policies. Existing stores and
+the namespace are kept (the namespace has `helm.sh/resource-policy: keep`); delete them by hand once they are empty.

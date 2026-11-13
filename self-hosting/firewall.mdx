@@ -1,0 +1,137 @@
+---
+title: "Firewall"
+description: "What the project Firewall installs on your cluster, its settings, region clusters, geolocation and troubleshooting."
+---
+Every project has a Firewall tab: IP blocking, custom rules, rate limits, bot and AI crawler rulesets, OWASP core
+rules and attack mode (design: `docs/platform/firewall.md`). On Kubernetes the rules run in
+**atoll-edge**, the server image started in edge mode, next to Traefik in every cluster that serves apps. Traefik asks
+the edge about each request through a `forwardAuth` Middleware before the request reaches the app; atoll-server itself
+is not in the request path.
+
+```
+ client ──► Traefik ── forwardAuth ──► atoll-edge ×2..6 (atoll-firewall) ── waf sidecar (127.0.0.1:8091, OWASP CRS)
+              │   ◄── 2xx: let through        │  watches ConfigMaps fw-<project>
+              │       403 / 429 / challenge ──┘  counters, blocks ──► atoll-edge-valkey
+              ▼
+     app pods (atoll-apps), web apps (atoll-server), custom domains (atoll-domains)
+
+ atoll-server (home) ── writes ConfigMaps fw-<project> and Middlewares fw-<project> into every cluster
+                     ── pulls traffic samples from every edge pod every 15 s (API server pod proxy)
+```
+
+## What gets installed
+
+The chart installs it with `features.firewall.enabled` (the default) when the ingress controller is Traefik
+(`ingress.controller: traefik`). With another controller nothing is installed: web apps are then filtered by the
+server itself and Ktor apps are not filtered.
+
+| Piece | Where | Notes |
+|-------|-------|-------|
+| Namespace `atoll-firewall` (`namespaces.firewall`) | | Pod Security `restricted`; `scripts/create-secrets.sh` creates it for the helmfile |
+| Deployment and Service `atoll-edge` (port 8090) | `atoll-firewall` | 2 replicas, PodDisruptionBudget, HPA on CPU (`features.firewall.edge`) |
+| `waf` sidecar (Coraza with the OWASP Core Rule Set) | each edge pod | Listens on 127.0.0.1:8091 only; `features.firewall.owasp` |
+| Deployment and Service `atoll-edge-valkey` | `atoll-firewall` | Rate limit counters and persistent blocks of the region; no persistence |
+| Secret `atoll-edge` (`challenge-key`) | `atoll-firewall` and the release namespace | Generated once and kept on upgrades; signs challenge cookies |
+| ConfigMap `fw-<project>` (label `atoll.app/firewall=config`) | `atoll-firewall` | Written by atoll-server when a project publishes; the edges watch them |
+| Middleware `fw-<project>` | `atoll-apps`, `atoll-domains` | Written by atoll-server; app and custom domain Ingresses reference it |
+| Middleware `fw-sites` | release namespace | On the wildcard `atoll-sites` Ingress: web apps, the edge finds the project from the host |
+| Role `atoll-edge`: ConfigMaps (read, watch) | `atoll-firewall` | |
+| Role `atoll-server`: ConfigMaps (manage), Services (get), pods (list), `pods/proxy` (get, delete) | `atoll-firewall` | |
+| Role `atoll-server-firewall`: `middlewares.traefik.io` (manage) | `atoll-apps`, `atoll-domains` | |
+| NetworkPolicies `atoll-edge`, `atoll-edge-valkey` | `atoll-firewall` | The edge accepts Traefik and the API server's pod proxy; Valkey only the edges |
+
+Traefik needs its `kubernetesCRD` provider (on in `deploy/selfhost/values/traefik.yaml.gotmpl`). Its entry points
+trust no forwarded headers: whatever a client sends in `X-Forwarded-For` is dropped and Traefik sets the address it
+sees, which `externalTrafficPolicy: Local` keeps real. The edge reads the client IP from the first `X-Forwarded-For`
+entry. Keep it that way: a load balancer that SNATs makes every client look like a private address, which the edge
+counts as in-cluster traffic, so attack mode and bot protection would let it through. If you put a proxy or
+CDN in front of Traefik, add its addresses to `forwardedHeaders.trustedIPs` of both entry points.
+
+Requests the firewall stops (deny, challenge, rate limit, persistent block) never reach the app's Service, so they
+don't show up in the Traefik service metrics that billing and the Metrics tab read: mitigated traffic is not billed.
+
+## Settings
+
+| Value | Default | What |
+|-------|---------|------|
+| `features.firewall.enabled` | `true` | Install the edge and put apps behind it |
+| `features.firewall.edge.replicas` / `.autoscaling.maxReplicas` | `2` / `6` | Every app request waits for an edge; keep at least two |
+| `features.firewall.owasp.enabled` | `true` | The waf sidecar; image `features.firewall.owasp.image` (the chart's appVersion by default) |
+| `features.firewall.valkey.enabled` | `true` | Without it every edge replica counts rate limits and keeps blocks on its own |
+| `features.firewall.geo.enabled` / `.url` | `true` / DB-IP Lite | Country, continent and ASN conditions; the URL is a template with `{db}` and `{month}` |
+| `features.firewall.cacheSize` | `512Mi` | emptyDir for the geo databases and good-bot ranges |
+| `features.firewall.challengeKeySecret` | generated | Your own Secret with `challenge-key` (16+ characters), in both namespaces |
+| `features.firewall.apiServerCIDRs` | `[]` | Where the API server's pod proxy connects from, see below |
+| `features.firewall.restrictEgress` | `false` | Limit the edges to DNS, Valkey, public HTTPS and the API server on `apiServerCIDRs` (443, 6443) |
+| `features.firewall.config` | `{}` | Plain `ATOLL_FIREWALL_*` settings for the server and the edges |
+
+Server and edge settings (env):
+
+| Variable | Default | What |
+|----------|---------|------|
+| `ATOLL_FIREWALL_EDGE` | `false` (`true` from the chart) | The edges filter traffic; the server publishes configs and collects traffic |
+| `ATOLL_FIREWALL_NAMESPACE` | `atoll-firewall` | Namespace of the edges in every cluster |
+| `ATOLL_FIREWALL_STATS_SECONDS` | `15` | How often the server pulls traffic samples from the edges |
+| `ATOLL_FIREWALL_RESYNC_SECONDS` | `300` | How often the server converges every cluster's ConfigMaps and Middlewares on the database |
+| `ATOLL_FIREWALL_ALERT_THRESHOLD` | `100000` | Mitigated requests in 10 minutes that raise an alert (and an email to the project's admins, at most once an hour) |
+| `ATOLL_FIREWALL_CHALLENGE_KEY` | from the Secret | Signs challenge cookies; the same on the server and the edges of a cluster |
+| `ATOLL_FIREWALL_CHALLENGE_DIFFICULTY` | `16` | Proof-of-work difficulty of the challenge page |
+| `ATOLL_FIREWALL_GEO_URL` | DB-IP Lite | Where the edges download the geo databases (`{db}`, `{month}`); empty turns geo off |
+| `ATOLL_FIREWALL_GOOD_BOTS_URLS` | the search engines' published ranges | Comma-separated; empty: no bot is verified |
+| `ATOLL_FIREWALL_INTERNAL_CIDRS` | private, CGNAT, loopback, link-local, ULA | Clients counted as in-cluster: attack mode and bot protection skip them |
+| `ATOLL_FIREWALL_VALKEY_TIMEOUT_MS`, `_WAF_TIMEOUT_MS`, `_CHECK_TIMEOUT_MS` | `50`, `200`, `500` | Past these the edge lets the request through |
+| `ATOLL_FIREWALL_VALKEY_URL`, `ATOLL_FIREWALL_WAF_URL`, `ATOLL_FIREWALL_CACHE_DIR`, `ATOLL_FIREWALL_APPS_DOMAIN`, `ATOLL_FIREWALL_POD_NAME` | set by the chart | The edge's Valkey, waf sidecar, cache directory, apps domain (web app and preview hosts) and pod name |
+
+Plan limits (`ATOLL_FIREWALL_MAX_RULES`, `ATOLL_FIREWALL_FREE_RULES`, ...) are listed under Limits in
+`docs/platform/firewall.md`.
+
+### Turning OWASP off
+
+Set `features.firewall.owasp.enabled: false` (helmfile: `firewall.owasp: false`). The edge pods then run without the
+`waf` sidecar and projects' OWASP settings have no effect; everything else keeps working. The local k3d rehearsal turns
+it off because the waf image isn't built there.
+
+### Turning the firewall off
+
+Set `features.firewall.enabled: false`. The server then stops adding the Middleware to Ingresses, but the ones it made
+before keep referencing it, and forwardAuth to a missing edge fails every request. So first remove the annotation
+`traefik.ingress.kubernetes.io/router.middlewares` from the Ingresses in `atoll-apps` and `atoll-domains`, then
+upgrade the release.
+
+## Region clusters
+
+A region needs its own edge: install the chart in edge mode with the region's kubeconfig. It installs only
+`atoll-firewall` and the rights the home server's ServiceAccount there needs (`features.firewall.regionServer`, the
+one in the region's kubeconfig, by default `atoll-apps/atoll` as in [Regions](/self-hosting/kubernetes#regions)). Set
+`urls.appsDomain` to the region's apps domain (`--set urls.appsDomain=...`), so the edge recognizes preview hosts.
+
+```sh
+# The release lives in the region's apps namespace; the chart creates atoll-firewall.
+helm upgrade --install atoll-edge deploy/helm/atoll -n atoll-apps --set mode=edge --set image.tag=<server version> \
+  --set 'features.firewall.regionServer.middlewareNamespaces={atoll-apps,atoll-domains}'   # atoll-domains only if it exists
+```
+
+The region's Traefik needs the `kubernetesCRD` provider as well. Until a region runs the edge, the server leaves the
+Ingresses there unfiltered (it looks for the `atoll-edge` Service once a minute) and the Firewall tab's rules don't
+apply to apps in that region. Each region generates its own challenge key; solved challenges don't carry over between
+regions.
+
+## Geolocation
+
+IP geolocation by DB-IP ([db-ip.com](https://db-ip.com)). The edges download the free DB-IP Lite country and ASN
+databases (licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)) into an emptyDir and refresh them
+monthly. Point `features.firewall.geo.url` at your own mirror if the edges can't reach the internet, or turn geo off
+with `features.firewall.geo.enabled: false`: country, continent and ASN conditions then never match.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| Every app answers 500 | Traefik can't reach the edge: `kubectl -n atoll-firewall get pods,endpoints atoll-edge`. forwardAuth fails closed, so the edge must run with at least one ready pod. Check the edge's logs and the NetworkPolicy `atoll-edge` (`ingress.controllerNamespace` must be Traefik's namespace) |
+| App routes answer 404 after a deploy, Traefik logs "middleware ... does not exist" | The Middleware `fw-<project>` is missing: Traefik's `kubernetesCRD` provider is off, or the server lacks `middlewares.traefik.io` rights in that namespace (the deploy log says so) |
+| Rules don't apply to a project's Ktor app | The Ingress has no `router.middlewares` annotation: the cluster had no `atoll-edge` Service when it was deployed (the server logs "No atoll-edge Service"). Redeploy once the edge runs |
+| A published change takes long to apply | `kubectl -n atoll-firewall get configmap fw-<project> -o yaml` shows what the edges have. The server retries failed clusters and resyncs every 5 minutes; its log names the region that failed |
+| The traffic view stays empty | The server collects through the API server's pod proxy. `kubectl auth can-i get pods/proxy -n atoll-firewall --as system:serviceaccount:atoll:atoll-server`, and on multi-node clusters add the control plane addresses to `features.firewall.apiServerCIDRs` so the edge's NetworkPolicy lets the proxy in |
+| Rate limits count per pod, blocks don't hold across pods | Valkey is off or unreachable: `kubectl -n atoll-firewall get pods -l app.kubernetes.io/name=atoll-edge-valkey` |
+| Large uploads fail with 413 | The project's OWASP rules inspect bodies and the request is larger than its limit; raise the limit or turn body inspection off |
+| Everyone is challenged again after an upgrade | The challenge key changed: keep Secret `atoll-edge` (the chart does) or set `features.firewall.challengeKeySecret` |

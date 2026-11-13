@@ -1,0 +1,144 @@
+---
+title: "Custom domains"
+sidebarTitle: "Domains"
+description: "Serve a project on your own domain, e.g. `www.example.com`, with an automatic HTTPS certificate. Custom domains always serve production; previews keep their hosts."
+---
+## Add a domain
+
+In the panel, open the project's **Domains** tab, enter the domain and choose what it serves. Or with the CLI, from the project directory:
+
+```sh
+atoll domains add api.example.com          # the primary Ktor app
+atoll domains add www.example.com --web    # the primary web app
+atoll domains add admin.example.com --web --module :apps:admin
+```
+
+| Target | Serves |
+|--------|--------|
+| Ktor (default) | the project's primary Ktor module, or `--module` |
+| Web (`--web`) | the project's primary web app, or `--module` |
+
+Adding and removing domains needs the **Admin** role; anyone who can see the project can list them.
+
+Rules: one host per domain (no wildcards), not under the platform's own apps domain. International names are accepted and stored as punycode (`bücher.example` becomes `xn--bcher-kva.example`). Names with `ß`, `ς` or zero width (non-)joiners are refused, because browsers translate them differently.
+
+## Create the DNS records
+
+The platform shows the exact records to create at your DNS provider. Every domain needs two:
+
+| Purpose | Type | Name | Value |
+|---------|------|------|-------|
+| Proves you own the domain | `TXT` | `_atoll-challenge.<domain>` | the token the platform shows, `atoll-verify-...` |
+| Sends traffic to the platform | `CNAME` | `<domain>` | The platform's CNAME target, e.g. `cname.atoll.app` |
+
+A zone apex (`example.com` itself) can't have a CNAME. For an apex the platform asks for `A`/`AAAA` records with the server's addresses, or, if the server has none configured, an `ALIAS` record (called `ANAME` or CNAME flattening by some providers) pointing to the CNAME target.
+
+Remove any other `A`, `AAAA` or `CNAME` records for the same name; the platform tells you which ones it found. If your provider proxies traffic (e.g. Cloudflare's orange cloud), switch the record to DNS only, otherwise the platform can't see where it points and the certificate can't be issued.
+
+**Keep the TXT record** for as long as the domain is in use: the platform checks it daily, and a domain whose TXT record is missing for 7 days is released.
+
+```sh
+atoll domains ls        # status, plus the records each pending domain still needs
+```
+
+## Verification and certificates
+
+The platform looks the records up itself, every minute for a new domain and less often as it gets older. To check right away:
+
+```sh
+atoll domains verify www.example.com
+```
+
+| Status | Meaning |
+|--------|---------|
+| `PENDING_VERIFICATION` | waiting for the DNS records; the message says which one is missing or wrong |
+| `ISSUING_CERTIFICATE` | records verified, a Let's Encrypt certificate is being issued (usually under a minute) |
+| `ACTIVE` | serving over HTTPS |
+| `FAILED` | needs attention: the certificate could not be issued, the DNS records no longer point to the platform, or another project took the domain over |
+
+DNS changes can take from seconds to a few hours to show up, depending on your provider and the record's TTL. `atoll domains verify` exits with `0` when the domain is `ACTIVE`, `2` while it is still being set up and `1` when it failed. When DNS can't be reached, nothing changes and the platform tries again a minute later.
+
+A domain that is not verified within **7 days** of being added is removed. `atoll domains ls` and the panel show the deadline.
+
+The platform checks active domains once a day. If the routing record stops pointing to the platform the domain becomes `FAILED` and goes back to `ACTIVE` as soon as the record is fixed. If the TXT record is missing, the platform warns on the domain and releases it after 7 days.
+
+A Ktor domain added before the project has a live Ktor app stays in `ISSUING_CERTIFICATE` and is set up after the next deployment. When a deployment changes the primary module, its domains follow.
+
+## Moving a domain between projects
+
+Any project can add a domain, even one another project serves. Each project gets its own TXT value; whoever controls the DNS decides by publishing it:
+
+1. Add the domain to the new project and publish its TXT value at `_atoll-challenge.<domain>`.
+2. Remove the old project's value from that TXT record. While both values are published, the domain stays with its current project.
+3. Verify. The new project owns the domain from then on; the old project's entry turns `FAILED` with the reason and stops serving at once. It is removed after 7 days unless it proves ownership again.
+
+## Remove a domain
+
+```sh
+atoll domains rm www.example.com    # asks first; --yes to skip
+```
+
+The domain stops serving at once and its certificate is deleted. Deleting the project removes all its domains.
+
+## Running your own server
+
+Settings (environment variables of the server):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ATOLL_DOMAINS_CNAME_TARGET` | `cname.<ATOLL_APPS_DOMAIN>` | host subdomains CNAME to; must resolve to your ingress controller (the wildcard record of the apps domain covers the default) |
+| `ATOLL_DOMAINS_A_RECORDS` | empty | comma-separated IPv4/IPv6 addresses of the ingress for apex domains; empty asks for ALIAS records instead |
+| `ATOLL_DOMAINS_RESOLVERS` | `1.1.1.1,8.8.8.8,9.9.9.9` | DNS servers used for verification, `host` or `host:port` |
+| `ATOLL_DOMAINS_CLUSTER_ISSUER` | `letsencrypt` | cert-manager ClusterIssuer for domain certificates |
+| `ATOLL_DOMAINS_CHECK_INTERVAL` | `60` | seconds between checks of pending domains and certificates |
+| `ATOLL_DOMAINS_RECHECK_INTERVAL` | `86400` | seconds between checks of verified domains |
+| `ATOLL_DOMAINS_MAX_PER_PROJECT` | `50` | domains per project |
+| `ATOLL_DOMAINS_UNVERIFIED_DAYS` | `7` | days before an unverified domain is removed |
+| `ATOLL_DOMAINS_TXT_GRACE_DAYS` | `7` | days an owner's TXT record may be missing before the domain is released |
+| `ATOLL_DOMAINS_NAMESPACE` | `atoll-domains` | namespace of domain Ingresses, TLS secrets and Services in Kubernetes |
+| `ATOLL_DOMAINS_SERVER_SERVICE` | `atoll-server` | Service in that namespace that leads to atoll-server |
+| `ATOLL_DOMAINS_SERVER_PORT` | `8080` | port of that Service |
+| `ATOLL_DOMAINS_CLUSTER_DOMAIN` | `cluster.local` | cluster DNS suffix used to reach apps from that namespace |
+| `ATOLL_DOMAINS_INGRESS_ANNOTATIONS` | empty | extra Ingress annotations, comma-separated `key=value` |
+
+With several replicas, one at a time runs the background checks (a Postgres advisory lock).
+
+A host claimed by any project answers `404` to everything unless it is an active web domain, so the platform's API and panel are never reachable on it.
+
+### Kubernetes
+
+Each owned domain gets an Ingress in `atoll-domains` with the annotation `cert-manager.io/cluster-issuer` and a TLS secret of the same name plus `-tls` next to it. Ingresses are named like an app of the project, `<project>--domain-<hash>` (Ktor) or `<project>-web--domain-<hash>` (web), so ingress traffic is billed to the project:
+
+- Ktor domains point at an ExternalName Service of the same name, which leads to the app's Service in the apps namespace (the one the project Ingress routes to, or the `--module`'s);
+- web domains point at the `atoll-server` ExternalName Service, which leads to atoll-server; it serves web apps by host.
+
+The server's rights on secrets are limited to `atoll-domains`. The ingress controller must follow ExternalName Services: on Traefik, enable `allowExternalNameServices` on the Kubernetes Ingress provider (ingress-nginx does by default). Set `ATOLL_INGRESS_CLASS` to your class, e.g. `traefik`, and add Traefik-specific annotations with `ATOLL_DOMAINS_INGRESS_ANNOTATIONS`, e.g. `traefik.ingress.kubernetes.io/router.entrypoints=websecure`. Redirect plain HTTP to HTTPS on the controller.
+
+The domain becomes `ACTIVE` once cert-manager's Certificate for that secret is `Ready`. Install [cert-manager](https://cert-manager.io/docs/installation/) and a ClusterIssuer that solves HTTP-01 challenges through your ingress class. The challenge must be reachable over plain HTTP, so don't restrict cert-manager's solver Ingresses to the HTTPS entrypoint:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik
+```
+
+`deploy/k8s` creates `atoll-domains` with the `atoll-server` alias and grants the server what it needs there (Ingresses, Services, reading Certificates, deleting TLS secrets).
+
+```sh
+kubectl -n atoll-domains get ingress,service,certificate
+```
+
+### Local mode
+
+Without Kubernetes there is no ingress or certificate: a verified domain is `ACTIVE` right away. Web domains are served by the server over plain HTTP on its own port; Ktor apps run on their own ports and are not routed by host.

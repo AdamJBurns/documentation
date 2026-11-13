@@ -1,0 +1,73 @@
+---
+title: "Upgrades"
+description: "Upgrade the platform, its dependencies and k3s safely."
+---
+Always: read the release notes, take a Postgres backup ([backups.md](/self-hosting/backups#postgres)), and see the
+change before applying it:
+
+```sh
+cd deploy/selfhost
+helmfile -e default --state-values-file ../../my-site.yaml diff
+helmfile -e default --state-values-file ../../my-site.yaml apply
+```
+
+`apply` only upgrades releases whose rendered manifests changed. Limit it to one release with
+`-l name=atoll`.
+
+## The platform
+
+1. Build and push the new server and builder images ([install.md](/self-hosting/install#3-images)).
+2. Set `atoll.tag` and `atoll.builderImage` in your site file, then `helmfile ... apply -l name=atoll`.
+
+The server Deployment rolls one pod at a time (`maxUnavailable: 0`) and applies database migrations on start.
+Deployments that are building on a replica that stops are marked failed ("Interrupted because the server
+running it stopped") and must be deployed again, so upgrade when no builds are running:
+
+```sh
+kubectl -n atoll-builds get jobs
+```
+
+Running user apps are not touched by an upgrade.
+
+Upgrading from a release where build pods called the server on port 8080: build pods now use the internal port
+8081 (`/internal` answers 404 on 8080), the build and publish containers get separate tokens, and app env vars
+move into one Secret per app (`<app>-env`) on each app's next deployment. The chart handles all of it; check
+that a custom `urls.internal` uses port 8081 and that your own NetworkPolicies let `atoll-builds` reach it.
+Builds running during the upgrade fail and must be deployed again.
+
+Upgrading to a release with [build runners](/self-hosting/runners): the server needs `ATOLL_RUNNERS_SEAL_KEY` and stops
+at startup without it. Add it to the env keys Secret before upgrading:
+
+```sh
+kubectl -n atoll patch secret atoll-env --type merge \
+  -p "{\"stringData\":{\"ATOLL_RUNNERS_SEAL_KEY\":\"$(openssl rand -base64 32)\"}}"
+```
+
+## Dependencies
+
+Chart versions are pinned in `helmfile.yaml.gotmpl`. To move one forward, change its `version`, read the
+chart's upgrade notes, and `apply -l name=<release>`. Notes per component:
+
+| Release | Watch out for |
+|---------|---------------|
+| cert-manager | CRDs are part of the chart (`crds.enabled`); upgrade one minor version at a time |
+| traefik | Major chart versions change values; run `helmfile diff` and check `ports` and `metrics` |
+| cloudnative-pg | Upgrading the operator restarts Postgres pods one by one (switchover for the primary). Postgres major upgrades are a separate, declarative step (`spec.imageName` of the cluster, see CNPG docs) |
+| plugin-barman-cloud | Keep it compatible with the operator version (CNPG release notes) |
+| seaweedfs | Volume servers restart one by one; with `replication: 001` data stays available |
+| zot | Single replica with `Recreate`: pulls fail for ~10 s; running apps keep running |
+| kube-prometheus-stack | Major versions often need CRD upgrades first (chart README) |
+
+## k3s
+
+Upgrade one node at a time, servers first, staying within one minor version per step:
+
+```sh
+kubectl drain node1 --ignore-daemonsets --delete-emptydir-data
+ssh root@node1 'K3S_VERSION=v1.37.1+k3s1 /opt/atoll-k3s/install.sh server'   # same role as before
+kubectl uncordon node1
+```
+
+Draining respects the PodDisruptionBudgets (atoll-server, Traefik, cert-manager, CloudNativePG), so a
+three-node cluster keeps serving. Build pods on a drained node are killed, failing their deployments. For
+many nodes, the [system-upgrade-controller](https://docs.k3s.io/upgrades/automated) automates the same steps.

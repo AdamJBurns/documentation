@@ -1,0 +1,39 @@
+---
+title: "The primary module"
+description: "A project can have several Ktor servers. Each one gets its own host, and one of them also serves the project's bare host, `my-app.atoll.app`. That one is the primary module."
+---
+## The default
+
+Without any setting, the platform picks the shallowest Ktor module, the one with the fewest `:` levels in its Gradle path. If several are equally shallow, it picks the first in alphabetical order. So `:api` wins over `:services:billing`, and `:admin` wins over `:api`.
+
+## Choosing it with `atoll.primary`
+
+Set the `atoll.primary` Gradle property to the module's path. The usual place is `gradle.properties` at the root of your build:
+
+```properties
+# Serve :api on the bare host; :admin stays at my-app--admin.atoll.app
+atoll.primary=:api
+```
+
+Commit the file so every deployment uses the same primary module.
+
+Rules:
+
+- The value is a Gradle path such as `:api` or `:services:gateway`.
+- It must name a Ktor module of the project. If it does not, the deployment fails with a message that lists the Ktor modules the platform found, e.g. "atoll.primary is set to ':web', which is not a Ktor module of this project (Ktor modules: :admin, :api)".
+- It only applies to Ktor modules. The primary web module is always the shallowest one.
+
+## Changing the primary module
+
+Change the property and deploy. The bare host moves to the new module once that module is up and running. Until then, the old primary keeps serving it, so the switch has no gap.
+
+## Where you see it
+
+`atoll deploy` and the panel mark the primary target:
+
+```text
+  KTOR  :api    READY  primary  https://my-app.atoll.app/
+  KTOR  :admin  READY           https://my-app--admin.atoll.app/
+```
+
+[Custom domains](/configure/custom-domains) point at the primary module unless you name another module.

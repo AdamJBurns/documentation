@@ -1,0 +1,71 @@
+---
+title: "Project structure"
+description: "The platform deploys a Gradle build. It looks at every module in the build and decides what each one is. You do not write a config file for this."
+---
+## What gets uploaded
+
+`atoll deploy` packages the directory you run it in (or the path you pass).
+
+- Inside a git repository, it uploads the files git knows about: tracked files, and untracked files that are not ignored.
+- Outside git, it uploads the whole directory except `.git`, `build`, `.gradle`, `.kotlin`, `.idea` and `node_modules`.
+- `local.properties` is never uploaded. It usually holds paths and keys from your machine.
+
+The CLI packs the files with `tar` into a compressed archive of at most 500 MB. The directory must be the root of the Gradle build, with `gradlew` in it. The platform builds with your wrapper.
+
+## How targets are detected
+
+The platform runs your build's configuration and checks each module:
+
+| Target | A module is this target when | The platform runs |
+|--------|------------------------------|------------|
+| Ktor server | It applies the `application` plugin and depends on a `ktor-server-*` artifact or applies `io.ktor.plugin` | `installDist` |
+| Web | Gradle registers `wasmJsBrowserDistribution` (or `jsBrowserDistribution` when there is no wasmJs one) | that task |
+| Android | It applies `com.android.application` | `assembleRelease` and `bundleRelease` with [keystore secrets](/targets/android#signing), otherwise `assembleDebug` |
+| Desktop | It applies `org.jetbrains.compose` and Gradle registers `packageUberJarForCurrentOS` | that task, plus [extras](/targets/desktop#what-you-get) |
+| iOS | It builds an iOS framework. Built as a simulator app on a macOS build runner, otherwise skipped; see [iOS](/targets/ios). | – |
+
+One module can be several targets. A Compose Multiplatform module with a `wasmJs` browser target and a desktop `jvm` target deploys as both a web app and a desktop app.
+
+If no module matches, the deployment fails with "No deployable targets found. The platform looks for Ktor servers (application plugin + ktor-server), Kotlin/Wasm or JS browser apps, Android apps and Compose Desktop apps."
+
+## Modules and hosts
+
+Every Ktor server and every web app gets its own host. The host is built from the project name and the module path:
+
+| What | Host |
+|------|------|
+| The primary Ktor module | `my-app.atoll.app` |
+| Every Ktor module, by name | `my-app--api.atoll.app`, `my-app--admin.atoll.app` |
+| The primary web module | `my-app-web.atoll.app` |
+| Other web modules | `my-app-web--dashboard.atoll.app` |
+
+The module part comes from the Gradle path: `:apps:admin` becomes `apps-admin`, and the root project becomes `root`. Paths longer than 17 characters, and paths that would end up with the same name, are shortened to 10 characters and a short hash, e.g. `my-very-lo-1a2b3c`. [Previews](/deploy/previews#hosts) get hosts of their own.
+
+The primary module owns the bare host. For web modules, it is the shallowest module (fewest `:` levels), then the first in alphabetical order. For Ktor modules the same rule applies, unless you choose one with [`atoll.primary`](primary-module.md).
+
+Self-hosted servers use their own apps domain instead of `atoll.app`.
+
+## Project names
+
+The project name becomes part of every host, so it has rules:
+
+- 3 to 40 characters: lowercase letters, digits and `-`.
+- Starts with a letter. Does not end with `-`.
+- Does not contain `--` and does not end with `-web`. Those mark module and web hosts.
+
+`atoll deploy` uses the directory name, lowercased, with other characters turned into `-`. If that is not valid, pass `--name`.
+
+## Example
+
+A full-stack project:
+
+```text
+my-app/
+├── gradlew
+├── settings.gradle.kts      include(":api", ":admin", ":composeApp", ":androidApp")
+├── gradle.properties        atoll.primary=:api
+├── api/                     Ktor server        → my-app.atoll.app, my-app--api.atoll.app
+├── admin/                   Ktor server        → my-app--admin.atoll.app
+├── composeApp/              wasmJs + desktop   → my-app-web.atoll.app, desktop JAR
+└── androidApp/              Android app        → APK (and App Bundle when signed)
+```

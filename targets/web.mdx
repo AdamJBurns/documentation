@@ -1,0 +1,56 @@
+---
+title: "Web apps"
+description: "The platform builds the browser target of a Kotlin Multiplatform module and serves the result as a static site on its own host."
+---
+## Set up the module
+
+Declare a browser target and mark it executable. Wasm and JS both work:
+
+```kotlin
+kotlin {
+    wasmJs {
+        browser()
+        binaries.executable()
+    }
+}
+```
+
+The platform runs `wasmJsBrowserDistribution`. If the module has no wasmJs browser target, it runs `jsBrowserDistribution` instead. Whatever the task writes to `build/dist/<target>/productionExecutable` is served as is, so `index.html` must be in that folder. The Compose Multiplatform wizard sets this up for you.
+
+## Hosts
+
+- The primary web module is served at `my-app-web.atoll.app`.
+- Other web modules are served at `my-app-web--<module>.atoll.app`.
+- [Previews](/deploy/previews#hosts) get their own hosts, such as `my-app--pr-42--web.atoll.app`, so a pull request never changes production.
+
+See [Project structure](/project-structure#modules-and-hosts) for how module names become hosts.
+
+## Talking to your Ktor server
+
+A web app usually needs the URL of its API. Set it as an env var for builds and read it in your Gradle build, for example with BuildKonfig or a generated source file:
+
+```sh
+atoll env set API_URL=https://my-app.atoll.app --no-runtime
+```
+
+See [Environment variables](/configure/environment-variables). Changes take effect on the next build.
+
+The web app and the server are on different hosts, also behind custom domains. Allow the web app's origin in the server with Ktor's CORS plugin.
+
+## Custom domains
+
+Add a domain with `--web` to serve the primary web app on it:
+
+```sh
+atoll domains add www.example.com --web
+```
+
+See [Custom domains](/configure/custom-domains).
+
+## Caching
+
+`index.html` and other HTML files are always revalidated, so a new deployment shows up at once. Files with a content hash in their name, such as `app.3f2a9c1b.js`, are cached for a year. Everything else is cached and revalidated with its ETag.
+
+## Billing
+
+Web apps are billed for the data they send, per GB. Builds count as build minutes. See [Billing](/teams/billing).
